@@ -682,6 +682,60 @@ async fn unary_generate_returns_collected_text() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn generate_internal_failure_returns_internal() {
+    for streaming in [false, true] {
+        for partial_tokens in [vec![], vec![b'h' as u32, b'i' as u32]] {
+            let mut output_specs = Vec::new();
+            if !partial_tokens.is_empty() {
+                output_specs.push((partial_tokens.clone(), None));
+            }
+            output_specs.push((vec![], Some(EngineCoreFinishReason::Error)));
+            let (mut client, server_task, engine_task) =
+                grpc_test_server(b"engine-grpc-internal-error", output_specs).await;
+            let request = pb::GenerateRequest {
+                request_id: "test-internal-error".to_string(),
+                model: "test-model".to_string(),
+                prompt: Some(pb::generate_request::Prompt::Text("hello".to_string())),
+                response: Some(pb::ResponseOptions {
+                    output_token_ids: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+
+            let status = if streaming {
+                let mut stream =
+                    client.generate_stream(request).await.expect("streaming generate").into_inner();
+                let mut token_ids = Vec::new();
+                let status = loop {
+                    match stream.message().await {
+                        Ok(Some(response)) => {
+                            if let Some(output) = response.outputs {
+                                assert!(output.finish_info.is_none(), "failure must not complete");
+                                token_ids.extend(output.token_ids);
+                            }
+                        }
+                        Ok(None) => panic!("failure must terminate with an error"),
+                        Err(status) => break status,
+                    }
+                };
+                assert_eq!(token_ids, partial_tokens);
+                assert!(stream.message().await.expect("stream ended").is_none());
+                status
+            } else {
+                client.generate(request).await.expect_err("generation must fail")
+            };
+            assert_eq!(status.code(), tonic::Code::Internal);
+            assert!(status.message().contains("internal error during generation"));
+
+            engine_task.await.expect("mock engine task");
+            server_task.abort();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn unary_generate_with_token_ids_prompt() {
     let (mut client, server_task, engine_task) =
         grpc_test_server(b"engine-grpc-token-ids", default_stream_output_specs()).await;

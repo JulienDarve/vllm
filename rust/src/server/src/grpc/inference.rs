@@ -14,7 +14,9 @@ use tracing::{Span, info, info_span, warn};
 use tracing_futures::Instrument as _;
 use uuid::Uuid;
 use vllm_llm::current_unix_timestamp_secs;
-use vllm_text::{DecodedTextEvent, Prompt, SampledDelta, TextOutputStreamExt as _, TextRequest};
+use vllm_text::{
+    DecodedTextEvent, FinishReason, Prompt, SampledDelta, TextOutputStreamExt as _, TextRequest,
+};
 
 use super::convert::{self, ResponseOpts};
 use super::{InferenceServer, pb};
@@ -241,6 +243,9 @@ impl pb::inference_server::Inference for InferenceServiceImpl {
             .instrument(request_span.clone())
             .await
             .map_err(|error| log_text_error(&request_span, started_at, "collection", error))?;
+        if matches!(collected.finish_reason, FinishReason::Error) {
+            return Err(log_generation_error(&request_span, started_at));
+        }
         info!(
             parent: &request_span,
             elapsed_ms = started_at.elapsed().as_millis() as u64,
@@ -309,6 +314,12 @@ impl pb::inference_server::Inference for InferenceServiceImpl {
                 while let Some(event) = stream.next().await {
                     let response = match event {
                         Err(error) => Err(log_text_error(&task_span, started_at, "stream", error)),
+                        Ok(DecodedTextEvent::TextDelta {
+                            finished: Some(ref finished),
+                            ..
+                        }) if matches!(finished.finish_reason, FinishReason::Error) => {
+                            Err(log_generation_error(&task_span, started_at))
+                        }
                         Ok(DecodedTextEvent::Start {
                             prompt_token_ids,
                             prompt_logprobs,
@@ -343,7 +354,8 @@ impl pb::inference_server::Inference for InferenceServiceImpl {
                         }),
                     };
 
-                    if tx.send(response).await.is_err() {
+                    let failed = response.is_err();
+                    if tx.send(response).await.is_err() || failed {
                         break;
                     }
                 }
@@ -376,7 +388,24 @@ fn log_text_error(
     phase: &'static str,
     error: vllm_text::Error,
 ) -> Status {
-    let status = text_error_to_status(error);
+    log_status(request_span, started_at, phase, text_error_to_status(error))
+}
+
+fn log_generation_error(request_span: &Span, started_at: Instant) -> Status {
+    log_status(
+        request_span,
+        started_at,
+        "generation",
+        Status::internal("request failed with an internal error during generation"),
+    )
+}
+
+fn log_status(
+    request_span: &Span,
+    started_at: Instant,
+    phase: &'static str,
+    status: Status,
+) -> Status {
     warn!(
         parent: request_span,
         phase,
