@@ -682,6 +682,65 @@ async fn unary_generate_returns_collected_text() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn engine_error_finish_returns_internal_for_unary_and_streaming() {
+    for streaming in [false, true] {
+        for prefix in [vec![], vec![b'h' as u32]] {
+            let mut output_specs = Vec::new();
+            if !prefix.is_empty() {
+                output_specs.push((prefix.clone(), None));
+            }
+            output_specs.push((vec![], Some(EngineCoreFinishReason::Error)));
+            let (mut client, server_task, engine_task) =
+                grpc_test_server(b"engine-grpc-error", output_specs).await;
+            let request = pb::GenerateRequest {
+                request_id: "test-engine-error".to_string(),
+                model: "test-model".to_string(),
+                prompt: Some(pb::generate_request::Prompt::Text("hello".to_string())),
+                stopping: Some(pb::StoppingCriteria {
+                    max_new_tokens: 10,
+                    ..Default::default()
+                }),
+                response: Some(pb::ResponseOptions {
+                    output_token_ids: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+
+            let status = if streaming {
+                let mut stream =
+                    client.generate_stream(request).await.expect("start stream").into_inner();
+                let mut received_tokens = Vec::new();
+                let status = loop {
+                    match stream.message().await {
+                        Ok(Some(response)) => {
+                            if let Some(output) = response.outputs {
+                                assert!(
+                                    output.finish_info.is_none(),
+                                    "error became a finish event"
+                                );
+                                received_tokens.extend(output.token_ids);
+                            }
+                        }
+                        Ok(None) => panic!("engine error ended as a successful stream"),
+                        Err(status) => break status,
+                    }
+                };
+                assert_eq!(received_tokens, prefix);
+                status
+            } else {
+                client.generate(request).await.expect_err("engine error must fail the RPC")
+            };
+            assert_eq!(status.code(), tonic::Code::Internal);
+
+            engine_task.await.expect("mock engine task");
+            server_task.abort();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn unary_generate_with_token_ids_prompt() {
     let (mut client, server_task, engine_task) =
         grpc_test_server(b"engine-grpc-token-ids", default_stream_output_specs()).await;
@@ -728,7 +787,7 @@ async fn unary_generate_prepares_multimodal_input_for_engine_core() {
                 assert_eq!(features.len(), 2);
 
                 for (feature, identifier) in features.iter().zip(["image-1", "image-2"]) {
-                    assert_eq!(feature.modality, "image");
+                    assert_eq!(feature.modality.as_str(), "image");
                     assert_eq!(feature.identifier, identifier);
                     assert!(feature.mm_position.length > 1);
                     assert_eq!(
@@ -1595,8 +1654,16 @@ async fn control_abort_resolves_external_id_and_empty_is_noop() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn control_reports_server_and_model_info() {
+    let mut ready = default_ready_response();
+    ready.effective_attention_block_size = Some(64);
     let (generate_service, control_service, engine_health, _engine_task) =
-        setup_grpc_service(b"engine-grpc-info", default_stream_output_specs()).await;
+        setup_grpc_service_with_engine_script(
+            b"engine-grpc-info".to_vec(),
+            ready,
+            Arc::new(FakeTextBackend),
+            |_, _| boxed_test_future(async {}),
+        )
+        .await;
     let (channel, server_task) = start_grpc_test_server(
         generate_service,
         control_service,
@@ -1612,6 +1679,7 @@ async fn control_reports_server_and_model_info() {
         .expect("get server info")
         .into_inner();
     assert_eq!(server.engine_version, "test-vllm-version");
+    assert_eq!(server.effective_attention_block_size, Some(64));
     assert_eq!(server.api_version, "vllm");
     assert_eq!(server.instance_id, "test-instance");
     assert_eq!(server.max_model_len, DEFAULT_MOCK_MAX_MODEL_LEN as u32);
@@ -1879,6 +1947,7 @@ async fn control_aggregates_multi_engine_capacity() {
     ready_0.weight_transfer_backend = Some("nccl".to_string());
     ready_0.enable_sleep_mode = true;
     ready_0.supports_draft_weight_updates = true;
+    ready_0.effective_attention_block_size = Some(64);
 
     let mut ready_1 = default_ready_response();
     ready_1.max_model_len = 4_096;
@@ -1932,6 +2001,7 @@ async fn control_aggregates_multi_engine_capacity() {
     .into_inner();
     assert_eq!(server.max_model_len, 4_096);
     assert_eq!(server.total_kv_blocks, 30);
+    assert!(server.effective_attention_block_size.is_none());
     let rl = server.rl_capabilities.expect("RL capabilities");
     assert!(!rl.weight_transfer_enabled);
     assert!(rl.weight_transfer_backend.is_empty());
