@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.multimodal.inputs import PlaceholderRange
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -132,6 +133,10 @@ def _split(
     partial_hit: bool = False,
     num_prefill_checkpoint_blocks: int = 0,
     max_num_scheduled_tokens: int = 16384,
+    checkpoint_alignment: int | None = 16,
+    reuse_initial_block: bool = False,
+    reuse_stops: bool = False,
+    num_prefill_lookahead: int = 1,
 ) -> int:
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
     if use_eagle_block_drop is None:
@@ -148,35 +153,83 @@ def _split(
         hash_block_size=ATTN_BLOCK_SIZE,
         mamba_has_prefill_checkpoint_blocks=(num_prefill_checkpoint_blocks > 0),
         mamba_prefill_checkpoint_alignment=(
-            16 if num_prefill_checkpoint_blocks > 0 else None
+            checkpoint_alignment if num_prefill_checkpoint_blocks > 0 else None
         ),
+        mamba_prefill_checkpoint_reuses_initial_block=reuse_initial_block,
+        mamba_prefill_checkpoint_copies_initial_block=False,
+        mamba_prefill_checkpoint_reuse_stops=reuse_stops,
+        num_prefill_lookahead=num_prefill_lookahead,
     )
     return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
 
 
 @pytest.mark.parametrize(
-    ("prompt_len", "num_new_tokens", "use_eagle", "expected"),
+    ("prompt_len", "num_new_tokens", "use_eagle", "expected", "expected_reuse_stops"),
     [
-        (2002, 2002, False, 2002),
-        (3602, 2000, False, MAMBA_BLOCK_SIZE),
-        (3602, 3602, True, 3602),
-        (2002, 2002, True, 2002),
-        (3602, 512, True, 0),
-        (3602, 1700, True, MAMBA_BLOCK_SIZE),
+        # A valid internal export finishes the prompt in one chunk by default;
+        # opt-in reuse stops end the first chunk at the replay boundary.
+        (2002, 2002, False, 2002, MAMBA_BLOCK_SIZE),
+        (3602, 2000, False, MAMBA_BLOCK_SIZE, MAMBA_BLOCK_SIZE),
+        (3602, 3602, True, 3602, MAMBA_BLOCK_SIZE),
+        (2002, 2002, True, 2002, 2002),
+        (3602, 512, True, 0, 0),
+        (3602, 1700, True, MAMBA_BLOCK_SIZE, MAMBA_BLOCK_SIZE),
     ],
 )
+@pytest.mark.parametrize("reuse_stops", [False, True])
 def test_internal_checkpoint_split(
-    prompt_len: int, num_new_tokens: int, use_eagle: bool, expected: int
+    prompt_len: int,
+    num_new_tokens: int,
+    use_eagle: bool,
+    expected: int,
+    expected_reuse_stops: int,
+    reuse_stops: bool,
 ) -> None:
     (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
+    assert _split(
+        request,
+        num_new_tokens,
+        use_eagle=use_eagle,
+        num_prefill_checkpoint_blocks=1,
+        reuse_stops=reuse_stops,
+    ) == (expected_reuse_stops if reuse_stops else expected)
+
+
+@pytest.mark.parametrize("use_eagle", [False, True])
+@pytest.mark.parametrize("alignment", [None, 256])
+def test_reserved_slot_without_eligible_export_keeps_legacy_hash_aligned_tail(
+    use_eagle: bool,
+    alignment: int | None,
+) -> None:
+    prompt_len = 2000
+    (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
+    request.num_computed_tokens = MAMBA_BLOCK_SIZE
+    legacy_tail = prompt_len - (ATTN_BLOCK_SIZE if use_eagle else 0)
+    for reserved_slots in (0, 1):
+        assert (
+            _split(
+                request,
+                prompt_len - MAMBA_BLOCK_SIZE,
+                use_eagle=use_eagle,
+                partial_hit=True,
+                num_prefill_checkpoint_blocks=reserved_slots,
+                checkpoint_alignment=alignment,
+            )
+            == legacy_tail - MAMBA_BLOCK_SIZE
+        )
+
+    # A real exporter instead promises the preceding hash unit; its aligned
+    # initial-state alias must split at that same promised checkpoint.
     assert (
         _split(
             request,
-            num_new_tokens,
+            prompt_len - MAMBA_BLOCK_SIZE,
             use_eagle=use_eagle,
+            partial_hit=True,
             num_prefill_checkpoint_blocks=1,
+            checkpoint_alignment=1,
         )
-        == expected
+        == legacy_tail - ATTN_BLOCK_SIZE - MAMBA_BLOCK_SIZE
     )
 
 
@@ -211,6 +264,156 @@ def test_partial_checkpoint_resume_stops_at_mamba_block_boundary() -> None:
         )
         == MAMBA_BLOCK_SIZE - resume_at % MAMBA_BLOCK_SIZE
     )
+
+    # GDN can export the tail in a private initial block, so by default one
+    # forward runs to the end. Opt-in reuse stops first materialize the
+    # full-block state at the warm replay boundary.
+    for reuse_stops, expected in (
+        (False, prompt_len - resume_at),
+        (True, 2 * MAMBA_BLOCK_SIZE - resume_at),
+    ):
+        assert (
+            _split(
+                request,
+                prompt_len - resume_at,
+                use_eagle=False,
+                partial_hit=True,
+                num_prefill_checkpoint_blocks=1,
+                checkpoint_alignment=1,
+                reuse_initial_block=True,
+                reuse_stops=reuse_stops,
+            )
+            == expected
+        )
+    # A block-aligned resume whose checkpoint column is the initial-state one
+    # holds the (shared) boundary state there, so in either mode it keeps
+    # stopping at the prompt's partial-tail boundary.
+    short_len = 3000
+    (short,) = create_requests(1, num_tokens=short_len, block_size=ATTN_BLOCK_SIZE)
+    short.num_computed_tokens = MAMBA_BLOCK_SIZE
+    tail = short_len // ATTN_BLOCK_SIZE * ATTN_BLOCK_SIZE
+    for reuse_stops in (False, True):
+        assert (
+            _split(
+                short,
+                short_len - MAMBA_BLOCK_SIZE,
+                use_eagle=False,
+                partial_hit=True,
+                num_prefill_checkpoint_blocks=1,
+                checkpoint_alignment=1,
+                reuse_initial_block=True,
+                reuse_stops=reuse_stops,
+            )
+            == tail - MAMBA_BLOCK_SIZE
+        )
+
+
+@pytest.mark.parametrize("reuse_stops", [False, True])
+@pytest.mark.parametrize(
+    ("mm_offset", "num_outputs", "lookahead", "capped"),
+    [
+        # Text-only: nothing after the split can shorten the chunk.
+        (None, 0, 1, False),
+        # An encoder input inside the chunk may be unschedulable this step.
+        (3000, 0, 1, True),
+        # The prompt's last token.
+        (3601, 0, 1, True),
+        # Already behind the chunk start: it cannot cap the chunk.
+        (100, 0, 1, False),
+        # A resumed request whose chunk ends inside the lookahead reservation.
+        (None, 2, 4, True),
+        (None, 2, 1, False),
+    ],
+)
+def test_mid_block_export_chunk_that_may_be_capped_stops_at_next_boundary(
+    mm_offset: int | None,
+    num_outputs: int,
+    lookahead: int,
+    capped: bool,
+    reuse_stops: bool,
+) -> None:
+    """A later cap can cancel the export a mid-block chunk relies on.
+
+    Its untouched private initial column would then be hashed as the state at
+    the next block boundary, so such a chunk stops there instead.
+    """
+    prompt_len = 3602
+    resume_at = 1984
+    (request,) = create_requests(
+        1,
+        num_tokens=prompt_len,
+        mm_positions=(
+            [[PlaceholderRange(offset=mm_offset, length=1)]]
+            if mm_offset is not None
+            else None
+        ),
+        block_size=ATTN_BLOCK_SIZE,
+    )
+    for _ in range(num_outputs):
+        request.append_output_token_ids(0)
+    request.num_computed_tokens = resume_at
+    # Ends at the prefill end: the prompt, or the last output to replay.
+    num_new_tokens = max(prompt_len, request.num_tokens - 1) - resume_at
+    expected = (
+        2 * MAMBA_BLOCK_SIZE - resume_at if capped or reuse_stops else num_new_tokens
+    )
+    assert (
+        _split(
+            request,
+            num_new_tokens,
+            use_eagle=False,
+            partial_hit=True,
+            num_prefill_checkpoint_blocks=1,
+            checkpoint_alignment=1,
+            reuse_initial_block=True,
+            reuse_stops=reuse_stops,
+            num_prefill_lookahead=lookahead,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("prompt_len", [3201, 3202, 3203])
+def test_mid_block_export_within_lookahead_runway_never_stalls(
+    prompt_len: int,
+) -> None:
+    """An image in the window must not force a stop inside the runway.
+
+    Stopping at boundary 3200 would leave fewer than the drafter's four
+    lookahead tokens; the reservation then pulls every later chunk back
+    below 3200 and the request is never scheduled again. Any capped end past
+    3200 is pulled back to or below it anyway, so no stop is needed.
+    """
+    lookahead = 4
+    (request,) = create_requests(
+        1,
+        num_tokens=prompt_len,
+        mm_positions=[[PlaceholderRange(offset=3100, length=1)]],
+        block_size=ATTN_BLOCK_SIZE,
+    )
+    request.num_computed_tokens = 1984
+    chunk_ends: list[int] = []
+    while request.num_computed_tokens < prompt_len:
+        num_new = _split(
+            request,
+            prompt_len - request.num_computed_tokens,
+            use_eagle=False,
+            partial_hit=True,
+            num_prefill_checkpoint_blocks=1,
+            checkpoint_alignment=1,
+            reuse_initial_block=True,
+            num_prefill_lookahead=lookahead,
+        )
+        num_new = Scheduler._reserve_prefill_lookahead(
+            SimpleNamespace(num_prefill_lookahead=lookahead),
+            request,
+            request.num_computed_tokens,
+            num_new,
+        )
+        assert num_new > 0, f"stalled after chunk ends {chunk_ends}"
+        request.num_computed_tokens += num_new
+        chunk_ends.append(request.num_computed_tokens)
+    assert chunk_ends == [prompt_len]
 
 
 def test_disabling_eagle_block_drop_keeps_the_trailing_cache_boundary() -> None:

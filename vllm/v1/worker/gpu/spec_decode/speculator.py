@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.eplb.eplb_state import EplbState
@@ -16,6 +17,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models import supports_multimodal_embeddings
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.triton_utils import tl, triton
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.spec_decode import (
@@ -30,12 +32,15 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import maybe_prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import DPSyncState
+from vllm.v1.worker.gpu.glue_pdl import glue_pdl
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.spec_decode import draft_vocab_head
 from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
     OnlineAcceptanceEstimator,
 )
+from vllm.v1.worker.gpu.spec_decode.split_argmax import split_argmax
 from vllm.v1.worker.utils import AttentionGroup
 
 if TYPE_CHECKING:
@@ -133,6 +138,7 @@ class DraftModelSpeculator(BaseSpeculator):
         self.use_local_argmax_reduction = (
             self.speculative_config.use_local_argmax_reduction
         )
+        self.use_split_row_argmax = envs.VLLM_DRAFT_SPLIT_ROW_ARGMAX
 
         # DP configuration
         self.dp_size = vllm_config.parallel_config.data_parallel_size
@@ -198,6 +204,8 @@ class DraftModelSpeculator(BaseSpeculator):
 
         self.supports_mm_inputs = False
         self.pcp_manager: PCPManager | None = None
+        # Opt-in reduced-vocabulary greedy draft head (VLLM_DRAFT_LMH_VOCAB).
+        self.draft_vocab_head: draft_vocab_head.DraftVocabHead | None = None
 
     @abstractmethod
     def load_draft_model(
@@ -217,6 +225,18 @@ class DraftModelSpeculator(BaseSpeculator):
 
         self.model = self.load_draft_model(target_model, target_attn_layer_names)
         self._validate_local_argmax_reduction()
+        if draft_vocab_head.ENABLED:
+            if (
+                self.speculative_config.draft_sample_method != "greedy"
+                or self.use_local_argmax_reduction
+                or self.enable_adaptive_verification
+                or self.draft_watermarker is not None
+            ):
+                raise ValueError(
+                    "VLLM_DRAFT_LMH_VOCAB needs greedy drafts without local "
+                    "argmax reduction, adaptive verification or watermarking."
+                )
+            self.draft_vocab_head = draft_vocab_head.maybe_build(self.model)
 
         all_attn_layers = set[str](
             get_layers_from_vllm_config(
@@ -408,6 +428,11 @@ class DraftModelSpeculator(BaseSpeculator):
         draft_step: torch.Tensor,
         draft_logits: torch.Tensor | None,
     ) -> torch.Tensor:
+        if self.draft_vocab_head is not None:
+            # Greedy draft over the token-id subset (draft proposals only).
+            return draft_vocab_head.sample(
+                self.draft_vocab_head, self.model, hidden_states
+            )
         if draft_logits is not None:
             logits = self.model.compute_logits(hidden_states)
             sampled = gumbel_sample(
@@ -433,7 +458,11 @@ class DraftModelSpeculator(BaseSpeculator):
             return self.model.get_top_tokens(hidden_states)
         else:
             logits = self.model.compute_logits(hidden_states)
-            sampled = logits.argmax(dim=-1)
+            # Bitwise equal to logits.argmax(dim=-1), split across the vocab.
+            if self.use_split_row_argmax:
+                sampled = split_argmax(logits)
+            else:
+                sampled = logits.argmax(dim=-1)
         self._maybe_predict_acceptance(logits, idx_mapping, draft_step)
         return sampled
 
@@ -473,6 +502,22 @@ class DraftModelSpeculator(BaseSpeculator):
             return
         self.draft_watermarker.prepare(contexts, watermarking)
 
+    def use_request_params(
+        self, temperature: torch.Tensor, seeds: torch.Tensor
+    ) -> None:
+        """Read the per-request temperature and seeds straight from these
+        [max_num_reqs] device tensors, instead of copying them every step.
+
+        They must keep their address for the life of the drafter (its CUDA
+        graphs read them), and be updated in stream order. Call before capture.
+        """
+        assert temperature.shape == self.temperature.shape
+        assert temperature.dtype == self.temperature.dtype
+        assert seeds.shape == self.seeds.shape and seeds.dtype == self.seeds.dtype
+        assert temperature.device == self.temperature.device == seeds.device
+        self.temperature = temperature
+        self.seeds = seeds
+
     def _copy_request_inputs(
         self,
         num_reqs: int,
@@ -482,6 +527,10 @@ class DraftModelSpeculator(BaseSpeculator):
         temperature: torch.Tensor,
         # [max_num_reqs]
         seeds: torch.Tensor,
+        # VLLM_DRAFT_ONE_GRAPH: [num_reqs] num_rejected and its static
+        # [max_num_reqs] copy (written in the same launch, padded with 0).
+        num_rejected: torch.Tensor | None = None,
+        num_rejected_out: torch.Tensor | None = None,
     ) -> None:
         # Copy temperature, seeds, and idx mapping to the pre-allocated buffers.
         # NOTE(woosuk): For draft sampling, we only consider the temperature
@@ -489,12 +538,25 @@ class DraftModelSpeculator(BaseSpeculator):
         # for simplicity and performance.
         # While this may slightly degrade the acceptance rate, it does not
         # affect the output distribution after rejection sampling.
-        self.temperature.copy_(temperature)
-        self.seeds.copy_(seeds)
-        self.idx_mapping[:num_reqs].copy_(idx_mapping)
+        if temperature is not self.temperature:
+            self.temperature.copy_(temperature)
+        if seeds is not self.seeds:
+            self.seeds.copy_(seeds)
         # idx_mapping for CG padded requests points to -1, which is ignored
         # during sampling to prevent writing stale values to draft logits.
-        self.idx_mapping[num_reqs:].fill_(-1)
+        copy_rejected = num_rejected is not None and num_rejected_out is not None
+        _copy_idx_mapping_kernel[(1,)](
+            self.idx_mapping,
+            idx_mapping,
+            num_reqs,
+            self.max_num_reqs,
+            num_rejected_out if copy_rejected else self.idx_mapping,
+            num_rejected if copy_rejected else self.idx_mapping,
+            BLOCK_SIZE=triton.next_power_of_2(self.max_num_reqs),
+            COPY_REJECTED=copy_rejected,
+            GLUE_PDL=glue_pdl(),
+            launch_pdl=glue_pdl(),
+        )
 
     def _build_uniform_batch_dp_sync(
         self,
@@ -534,4 +596,34 @@ class DraftModelSpeculator(BaseSpeculator):
             step=step,
             causal=causal,
             dcp_local_seq_lens=dcp_local_seq_lens,
+        )
+
+
+@triton.jit(do_not_specialize=["num_reqs"])
+def _copy_idx_mapping_kernel(
+    out_ptr,
+    idx_mapping_ptr,
+    num_reqs,
+    max_num_reqs,
+    # VLLM_DRAFT_ONE_GRAPH: also rejected_out[:num_reqs] = rejected,
+    # rejected_out[num_reqs:max_num_reqs] = 0.
+    rejected_out_ptr,
+    rejected_ptr,
+    BLOCK_SIZE: tl.constexpr,
+    COPY_REJECTED: tl.constexpr = False,
+    GLUE_PDL: tl.constexpr = False,
+):
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    # out[:num_reqs] = idx_mapping; out[num_reqs:max_num_reqs] = -1
+    offs = tl.arange(0, BLOCK_SIZE)
+    idx = tl.load(idx_mapping_ptr + offs, mask=offs < num_reqs, other=-1)
+    tl.store(out_ptr + offs, idx.to(out_ptr.dtype.element_ty), mask=offs < max_num_reqs)
+    if COPY_REJECTED:
+        rej = tl.load(rejected_ptr + offs, mask=offs < num_reqs, other=0)
+        tl.store(
+            rejected_out_ptr + offs,
+            rej.to(rejected_out_ptr.dtype.element_ty),
+            mask=offs < max_num_reqs,
         )

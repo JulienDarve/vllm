@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import numpy as np
 import torch
 
@@ -24,10 +26,24 @@ from vllm.v1.worker.gpu.sample.logprob import (
 )
 from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
+from vllm.v1.worker.gpu.sample.spec_topk_topp import (
+    MAX_TOP_K,
+    prepare_spec_top_k_top_p,
+)
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
 from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
 from vllm.v1.worker.gpu.sample.trace_replay import TraceReplayState
 from vllm.v1.worker.gpu.states import RequestState
+
+# GB300 lowc2: skip unchanged sampler-state staging on steps without new requests.
+_STATE_DIRTY_GATE = os.environ.get("VLLM_SAMPLER_STATE_DIRTY", "0") == "1"
+if _STATE_DIRTY_GATE:
+    from vllm.logger import init_logger as _init_logger
+
+    _init_logger(__name__).info(
+        "sampler state dirty skip on (VLLM_SAMPLER_STATE_DIRTY=1): unchanged "
+        "sampler-state / num_blocks staging is skipped"
+    )
 
 
 class Sampler:
@@ -49,7 +65,8 @@ class Sampler:
         self.use_fp64_gumbel = use_fp64_gumbel
 
         self.req_states = req_states
-        self.sampling_states = SamplingStates(max_num_reqs, vocab_size)
+        self._lowc2_dirty = True  # see apply_staged_writes (VLLM_SAMPLER_STATE_DIRTY)
+        self.sampling_states = SamplingStates(max_num_reqs, vocab_size, device)
         self.penalties_state = PenaltiesState(req_states)
         self.logit_bias_state = LogitBiasState(max_num_reqs, device)
         self.bad_words_state = BadWordsState(req_states)
@@ -68,6 +85,10 @@ class Sampler:
     def add_request(
         self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
     ) -> None:
+        # GB300 lowc2 (VLLM_SAMPLER_STATE_DIRTY=1): the per-request state rows
+        # change only here; apply_staged_writes then skips the per-step re-copy
+        # of unchanged UVA-backed state when nothing was added.
+        self._lowc2_dirty = True
         self.sampling_states.add_request(req_idx, sampling_params)
         self.penalties_state.add_request(req_idx, sampling_params)
         self.logit_bias_state.add_request(req_idx, prompt_len, sampling_params)
@@ -94,6 +115,18 @@ class Sampler:
         )
 
     def apply_staged_writes(self) -> None:
+        if _STATE_DIRTY_GATE:
+            # Every sampler state below (the DeviceParam sampling / penalty
+            # tables, the UVA-backed logit-bias, bad-words, logprob-token-ids,
+            # thinking-budget and trace-replay tensors, and their staged
+            # writes and pending reset lists) is written on the host only from
+            # add_request (above), so a step without a new request has nothing
+            # to stage: skip re-copying the unchanged host arrays into the next
+            # pool slot (exact: the current slot already holds this content).
+            # A new per-step host writer must set self._lowc2_dirty.
+            if not self._lowc2_dirty:
+                return
+            self._lowc2_dirty = False
         self.sampling_states.apply_staged_writes()
         self.penalties_state.apply_staged_writes()
         self.logit_bias_state.apply_staged_writes()
@@ -207,6 +240,35 @@ class Sampler:
         )
         return sampler_output
 
+    def fused_spec_sampling_params(
+        self, idx_mapping_np: np.ndarray
+    ) -> tuple[int, bool, bool] | None:
+        """(max_top_k, use_top_p, use_penalties) when apply_sampling_params
+        would only apply penalties, temperature and top-k/top-p with every
+        1 <= top_k <= MAX_TOP_K, the case fused_rejection_sample handles.
+        None when any other logits processor is active for the batch.
+        """
+        states = self.sampling_states
+        top_k = states.top_k.np[idx_mapping_np]
+        # Disabled top-k is stored as vocab_size, so this also requires top-k.
+        max_top_k = int(top_k.max()) if top_k.size else 0
+        if not 0 < max_top_k <= MAX_TOP_K:
+            return None
+        thinking = self.thinking_budget_state
+        if (
+            np.any(self.logit_bias_state.use_logit_bias[idx_mapping_np])
+            or int(self.bad_words_state.num_bad_words.np[idx_mapping_np].max()) > 0
+            or (
+                thinking.enabled
+                and np.any(thinking.use_thinking_budget[idx_mapping_np])
+            )
+            or np.any(states.min_p.np[idx_mapping_np] != 0.0)
+        ):
+            return None
+        use_top_p = bool(np.any(states.top_p.np[idx_mapping_np] != 1.0))
+        use_penalties = bool(np.any(self.penalties_state.use_penalty[idx_mapping_np]))
+        return max_top_k, use_top_p, use_penalties
+
     def apply_sampling_params(
         self,
         logits: torch.Tensor,
@@ -220,6 +282,39 @@ class Sampler:
     ) -> torch.Tensor:
         if not np.any(self.needs_logits_processing[idx_mapping_np]):
             return logits
+
+        states = self.sampling_states
+        if (
+            not skip_top_k_top_p
+            and states.use_split_row_top_k
+            and states.use_fused_prep
+            and logits.is_cuda
+            and logits.stride(1) == 1
+        ):
+            params = self.fused_spec_sampling_params(idx_mapping_np)
+            if params is not None:
+                max_top_k, use_top_p, use_penalties = params
+                penalties = self.penalties_state
+                return prepare_spec_top_k_top_p(
+                    logits,
+                    expanded_idx_mapping,
+                    input_ids,
+                    expanded_local_pos,
+                    states.temperature.gpu,
+                    states.top_k.gpu,
+                    states.top_p.gpu,
+                    (
+                        penalties.repetition_penalty.gpu,
+                        penalties.frequency_penalty.gpu,
+                        penalties.presence_penalty.gpu,
+                        penalties.prompt_bin_mask,
+                        penalties.output_bin_counts,
+                    )
+                    if use_penalties
+                    else None,
+                    max_top_k,
+                    use_top_p,
+                )
 
         # Copy logits to a new FP32 tensor.
         logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)

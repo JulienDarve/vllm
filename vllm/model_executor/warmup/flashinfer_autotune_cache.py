@@ -10,10 +10,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import vllm.envs as envs
+from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.distributed.parallel_state import GroupCoordinator
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+logger = init_logger(__name__)
 
 
 def flashinfer_autotune_cache_hash(runner: "GPUModelRunner") -> str:
@@ -38,7 +41,10 @@ def resolve_flashinfer_autotune_file(runner: "GPUModelRunner") -> Path:
 
     output_dir = root / flashinfer_autotune_cache_hash(runner)
     output_dir.mkdir(parents=True, exist_ok=True)
-    return output_dir / "autotune_configs.json"
+    cache_file = output_dir / "autotune_configs.json"
+    # VLLM_FLASHINFER_AUTOTUNE_FILE is read by the kernel warmup
+    # (flashinfer_autotune_pin.run_pinned_autotune); it is never copied here.
+    return cache_file
 
 
 def sync_flashinfer_autotune_cache(

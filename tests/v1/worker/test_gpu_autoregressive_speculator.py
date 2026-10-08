@@ -85,16 +85,18 @@ def _mock_base_model_load(monkeypatch):
 def _make_speculator(
     monkeypatch,
     output: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-) -> _TestSpeculator:
+    speculator_cls: type[AutoRegressiveSpeculator] = _TestSpeculator,
+) -> AutoRegressiveSpeculator:
     monkeypatch.setattr(
         spec_module,
         "set_forward_context",
         lambda *args, **kwargs: nullcontext(),
     )
 
-    speculator = object.__new__(_TestSpeculator)
+    speculator = object.__new__(speculator_cls)
     speculator.supports_mm_inputs = False
     speculator.pcp_manager = None
+    speculator.draft_out_rows = False
     speculator.vllm_config = None
     speculator.input_buffers = SimpleNamespace(
         input_ids=torch.arange(4),
@@ -493,3 +495,169 @@ def test_update_draft_decode_metadata_skips_without_scheduler_metadata(monkeypat
 
     assert not called
     assert metadata.scheduler_metadata is None
+
+
+class _PrunedAttentionDraftModel(torch.nn.Module):
+    """CPU consumer fixture: postattention pruning and sampled feedback use
+    the same rows, across both attention buckets. The kernel stand-in includes
+    causal KV length in the result, so rejection-tail mistakes affect sampling.
+    """
+
+    def __init__(self, impl, metadata):
+        super().__init__()
+        self.impl = impl
+        self.metadata = metadata
+        self.layer = SimpleNamespace(_q_scale=torch.tensor(1.0))
+
+    def forward(self, input_ids, positions, hidden_states, inputs_embeds, out_rows):
+        num_heads, head_size = self.impl.num_heads, self.impl.head_size
+        # Row t's query is t + 1: never zero.
+        query = (
+            (torch.arange(input_ids.shape[0], dtype=torch.float16) + 1)
+            .view(-1, 1, 1)
+            .expand(-1, num_heads, head_size)
+            .contiguous()
+        )
+        out = torch.full_like(query, float("nan"))
+        computed = self.impl._draft_prefill_attention(
+            self.layer, query, None, self.metadata, out
+        )
+        assert computed
+        return out.view(out.shape[0], -1)[out_rows]
+
+
+def test_draft_prefill_prune_with_rows_samples_computed_rows(monkeypatch):
+    """VLLM_MTP_DRAFT_PREFILL_PRUNE with VLLM_MTP_DRAFT_PREFILL_ROWS: the rows
+    the speculator samples (last accepted rows) must be rows the pruned
+    attention computed, including for prefill-bucket requests whose draft
+    tokens were partly rejected.
+    """
+    flashinfer_module = pytest.importorskip("vllm.v1.attention.backends.flashinfer")
+    from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        flashinfer_module.current_platform,
+        "is_device_capability_family",
+        lambda _: True,
+    )
+    monkeypatch.setattr(
+        flashinfer_module, "get_flashinfer_layout_string", lambda _: "HND"
+    )
+    monkeypatch.setattr(
+        flashinfer_module, "_get_trtllm_workspace_buffer", lambda: torch.empty(0)
+    )
+
+    def fake_trtllm_decode(**kwargs):
+        kwargs["out"].copy_(
+            kwargs["query"] + kwargs["seq_lens"][:, None, None].to(torch.float16) / 100
+        )
+
+    monkeypatch.setattr(
+        flashinfer_module, "trtllm_batch_decode_with_kv_cache", fake_trtllm_decode
+    )
+    impl = object.__new__(flashinfer_module.FlashInferImpl)
+    impl.num_heads, impl.head_size = 2, 2
+    impl.bmm1_scale = impl.bmm2_scale = 1.0
+    impl.window_left, impl.sinks = -1, None
+    impl.scale = 1.0
+    impl.kv_cache_dtype = "auto"
+    impl.dcp_world_size = 1
+    impl.is_kvcache_nvfp4 = False
+    impl.o_sf_scale = impl.logits_soft_cap = None
+    impl.supports_xqa_or_trtllm_gen_decode = True
+    impl.cache_config = SimpleNamespace(get_resolved_kv_cache_layout=lambda: None)
+    impl._trtllm_gen_decode_launch_config = lambda *args: (1, None)
+
+    # (query_len, seq_len, num_rejected): one 3-token spec decode, then a
+    # prefill-bucket request with 2 of its draft tokens rejected and a
+    # chunked prefill.
+    reqs = [(3, 40, 1), (5, 100, 2), (8, 1000, 0)]
+    num_reqs = len(reqs)
+    num_tokens = sum(q_len for q_len, _, _ in reqs)
+    last_token_indices = torch.zeros(8, dtype=torch.int64)
+    start = 0
+    for i, (q_len, _, num_rejected) in enumerate(reqs):
+        last_token_indices[i] = start + q_len - num_rejected - 1
+        start += q_len
+    metadata = SimpleNamespace(
+        causal=True,
+        use_cascade=False,
+        q_data_type_decode=torch.float16,
+        decode=None,
+        prefill=flashinfer_module.TRTLLMPrefill(
+            block_tables=torch.zeros((2, 1), dtype=torch.int32),
+            seq_lens=torch.tensor([100, 1000], dtype=torch.int32),
+            cum_seq_lens_q=torch.tensor([0, 5, 13], dtype=torch.int32),
+            cum_seq_lens_kv=torch.tensor([0, 100, 1100], dtype=torch.int32),
+            max_q_len=8,
+            max_seq_len=1000,
+        ),
+    )
+
+    hidden_size = impl.num_heads * impl.head_size
+    speculator = _make_speculator(
+        monkeypatch, torch.empty(0), speculator_cls=MTPSpeculator
+    )
+    speculator.model = _PrunedAttentionDraftModel(impl, metadata)
+    speculator._draft_prefill_prune_layer = SimpleNamespace(
+        impl=impl, layer_name="draft.attn"
+    )
+    speculator._draft_prefill_prune_group_id = None
+    # The linear-attention target group must not be used by the MTP layer.
+    speculator.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(layer_names=["target.linear"]),
+            SimpleNamespace(layer_names=["draft.attn"]),
+        ]
+    )
+    speculator.block_tables = SimpleNamespace(
+        input_block_tables=[None, torch.ones((num_reqs, 1), dtype=torch.int32)]
+    )
+    speculator.draft_max_seq_len = 1000
+    impl.draft_prefill_last_token_indices = last_token_indices
+    speculator.last_token_indices = last_token_indices
+    speculator.max_num_reqs = last_token_indices.shape[0]
+    speculator.draft_out_rows = True
+    speculator._draft_row_ids = torch.arange(num_tokens)
+    speculator.input_buffers = SimpleNamespace(
+        input_ids=torch.zeros(num_tokens, dtype=torch.int32),
+        positions=torch.cat(
+            [torch.arange(seq_len - q_len, seq_len) for q_len, seq_len, _ in reqs]
+        ),
+    )
+    speculator.hidden_states = torch.zeros(num_tokens, hidden_size)
+    speculator.idx_mapping = torch.arange(num_reqs, dtype=torch.int32)
+    speculator.draft_tokens = torch.zeros((num_reqs, 1), dtype=torch.int64)
+    speculator.sample_src_positions = torch.zeros(num_reqs, dtype=torch.int64)
+    speculator.temperature = speculator.seeds = speculator.draft_logits = None
+    speculator.current_draft_step = torch.tensor(0)
+    sampled = []
+
+    def fake_sample_draft(hidden_states, *args):
+        sampled.append(hidden_states.clone())
+        return torch.zeros(hidden_states.shape[0], dtype=torch.int64)
+
+    speculator.sample_draft = fake_sample_draft
+
+    speculator._prefill(
+        num_reqs,
+        num_tokens,
+        attn_metadata={"draft.attn": metadata},
+        slot_mappings=None,
+        num_tokens_across_dp=None,
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+    )
+
+    (sample_hidden_states,) = sampled
+    sampled_positions = torch.tensor(
+        [seq_len - num_rejected for _, seq_len, num_rejected in reqs]
+    )
+    expected = (
+        (last_token_indices[:num_reqs].to(torch.float16) + 1)
+        + sampled_positions.to(torch.float16) / 100
+    ).view(-1, 1)
+    torch.testing.assert_close(
+        sample_hidden_states, expected.expand(-1, hidden_size), rtol=0, atol=0
+    )
+    assert impl.draft_prefill_pruning is None

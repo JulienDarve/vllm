@@ -5,6 +5,8 @@ reclassification of non-spec decodes as prefills when spec decodes exist.
 Covers the fix for https://github.com/vllm-project/vllm/issues/34845.
 """
 
+import gc
+import weakref
 from dataclasses import dataclass
 
 import pytest
@@ -17,10 +19,12 @@ from tests.v1.attention.utils import (
 )
 from vllm.config import SpeculativeConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.attention.backends import gdn_attn
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
 )
+from vllm.v1.attention.backends.utils import compute_causal_conv1d_metadata
 from vllm.v1.kv_cache_interface import MambaSpec
 
 BLOCK_SIZE = 16
@@ -222,3 +226,129 @@ def test_full_cudagraph_spec_metadata_uses_request_count():
     assert meta.spec_query_start_loc.shape == (batch.batch_size + 1,)
     assert meta.num_accepted_tokens is not None
     assert meta.num_accepted_tokens.shape == (batch.batch_size,)
+
+
+@pytest.mark.parametrize(
+    "query_lens,num_decode_draft_tokens,expect_slices",
+    [
+        pytest.param([3, 3, 50, 1], [2, 2, -1, -1], True, id="spec_first"),
+        pytest.param([3, 3, 50, 0], [2, 2, -1, -1], True, id="spec_first_padded"),
+        pytest.param([50, 1, 3, 3], [-1, -1, 2, 2], True, id="non_spec_first"),
+        pytest.param([3, 50, 3, 1], [2, -1, 2, -1], False, id="interleaved"),
+        pytest.param([3, 3], [2, 2], False, id="pure_spec"),
+        pytest.param([1, 1, 40, 7], None, False, id="prefill_and_decode"),
+    ],
+)
+def test_mixed_batch_token_slices(
+    query_lens: list[int],
+    num_decode_draft_tokens: list[int] | None,
+    expect_slices: bool,
+):
+    """The forward slices spec/non-spec tokens instead of gathering them only
+    when the builder reports two contiguous blocks; the slices must then select
+    exactly the tokens the gather indices select. The per-step int64/inverted
+    copies of the prefill inputs must match the tensors they stand in for.
+    """
+    builder = _create_gdn_builder(num_speculative_tokens=2)
+    batch = BatchSpec(seq_lens=[q + 20 for q in query_lens], query_lens=query_lens)
+    meta = _build(builder, batch, num_decode_draft_tokens)
+
+    assert (meta.spec_token_start is not None) == expect_slices
+    assert (meta.non_spec_token_start is not None) == expect_slices
+    if expect_slices:
+        assert meta.spec_token_start is not None
+        assert meta.non_spec_token_start is not None
+        assert meta.spec_token_indx is not None
+        assert meta.non_spec_token_indx is not None
+        num_non_spec_tokens = meta.num_prefill_tokens + meta.num_decode_tokens
+        spec_rows = torch.arange(
+            meta.spec_token_start,
+            meta.spec_token_start + meta.num_spec_decode_tokens,
+        )
+        non_spec_rows = torch.arange(
+            meta.non_spec_token_start,
+            meta.non_spec_token_start + num_non_spec_tokens,
+        )
+        assert torch.equal(meta.spec_token_indx.cpu(), spec_rows)
+        assert torch.equal(meta.non_spec_token_indx.cpu(), non_spec_rows)
+
+    if meta.num_prefills > 0:
+        assert meta.prefill_state_indices is not None
+        assert meta.prefill_has_initial_state is not None
+        assert meta.prefill_state_indices_i64 is not None
+        assert meta.prefill_no_initial_state is not None
+        assert meta.prefill_state_indices_i64.dtype == torch.int64
+        assert torch.equal(
+            meta.prefill_state_indices_i64, meta.prefill_state_indices.long()
+        )
+        assert torch.equal(
+            meta.prefill_no_initial_state, ~meta.prefill_has_initial_state
+        )
+        if meta.prefill_query_start_loc_i64 is not None:
+            assert meta.prefill_query_start_loc is not None
+            assert torch.equal(
+                meta.prefill_query_start_loc_i64,
+                meta.prefill_query_start_loc.long(),
+            )
+
+
+@pytest.mark.parametrize(
+    "query_lens,num_decode_draft_tokens",
+    [
+        pytest.param([3, 3, 50, 1], [2, 2, -1, -1], id="spec_first"),
+        pytest.param([3, 50, 3, 1], [2, -1, 2, -1], id="interleaved"),
+        pytest.param([1, 1, 40, 7], None, id="prefill_and_decode"),
+    ],
+)
+def test_host_trim2_shared_build_freed_without_gc(
+    monkeypatch: pytest.MonkeyPatch,
+    query_lens: list[int],
+    num_decode_draft_tokens: list[int] | None,
+):
+    """VLLM_GDN_HOST_TRIM2: a prefill step's GDNSharedBuild (which holds the
+    step's device tensors) must be freed by reference counting alone once its
+    metadata is dropped. A reference cycle through the lazy causal_conv1d
+    metadata would only be freed by the cyclic GC, which gc.freeze() on every
+    admission (VLLM_GC_FREEZE_ADMIT) defeats: modelled here by gc.disable().
+    The lazy metadata must still be built once and match the eager one.
+    """
+    monkeypatch.setattr(gdn_attn, "GDN_HOST_TRIM2", True)
+    builder = _create_gdn_builder(num_speculative_tokens=2)
+    shared_refs: list[weakref.ref] = []
+    build_shared = builder._build_shared
+
+    def recording_build_shared(*args, **kwargs):
+        shared = build_shared(*args, **kwargs)
+        shared_refs.append(weakref.ref(shared))
+        return shared
+
+    monkeypatch.setattr(builder, "_build_shared", recording_build_shared)
+    batch = BatchSpec(seq_lens=[q + 20 for q in query_lens], query_lens=query_lens)
+
+    gc_was_enabled = gc.isenabled()
+    gc.collect()
+    gc.disable()
+    try:
+        meta = _build(builder, batch, num_decode_draft_tokens)
+        assert meta.num_prefills > 0
+        assert meta.batch_ptr is None
+        assert meta.conv1d_metadata_fn is not None
+        # What causal_conv1d_fn does on first use.
+        nums_dict, batch_ptr, token_chunk_offset_ptr = meta.conv1d_metadata_fn()
+        assert meta.conv1d_metadata_fn()[1] is batch_ptr
+        assert meta.non_spec_query_start_loc is not None
+        ref_nums_dict, ref_batch_ptr, ref_offset_ptr = compute_causal_conv1d_metadata(
+            meta.non_spec_query_start_loc.cpu(), device=DEVICE
+        )
+        assert nums_dict[8]["tot"] == ref_nums_dict[8]["tot"]
+        assert torch.equal(batch_ptr, ref_batch_ptr)
+        assert torch.equal(token_chunk_offset_ptr, ref_offset_ptr)
+
+        assert len(shared_refs) == 1
+        del meta, nums_dict, batch_ptr, token_chunk_offset_ptr
+        assert shared_refs[0]() is None, (
+            "GDNSharedBuild is kept alive by a reference cycle"
+        )
+    finally:
+        if gc_was_enabled:
+            gc.enable()
