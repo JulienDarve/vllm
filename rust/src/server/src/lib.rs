@@ -29,7 +29,8 @@ use axum::body::Body;
 use axum::http::Request;
 pub use config::{
     ApiServerOptions, Config, CoordinatorMode, CorsConfig, DEFAULT_KEEP_ALIVE_TIMEOUT,
-    DEFAULT_LOG_STATS_INTERVAL, HttpListenerMode, LoraModulePath, TlsConfig,
+    DEFAULT_LOG_STATS_INTERVAL, DEFAULT_REQUEST_BODY_LIMIT_BYTES, HttpListenerMode, LoraModulePath,
+    OutputLogging, TlsConfig,
 };
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -37,6 +38,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
 pub use render::{RenderConfig, serve_render};
+pub use routes::openai::utils::types::ReasoningEffort;
 use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server as TonicServer;
@@ -64,7 +66,6 @@ const GRPC_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(7200);
 /// How long the server waits for a keepalive PING reply before dropping the gRPC
 /// connection. 20s matches the gRPC-core default.
 const GRPC_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
-const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 
 /// Resolve the public model names accepted by the frontend.
 fn effective_served_model_names(model: &str, served_model_name: &[String]) -> Vec<String> {
@@ -130,24 +131,34 @@ async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     })
     .await
     .context("failed to connect to engine core")?;
+    let server_info = ServerInfoSnapshot::new(config, &client);
 
     let llm = Llm::new(client)
         .with_log_stats(config.log_stats_interval.filter(|_| !config.disable_log_stats))
         .with_request_id_randomization(!config.disable_request_id_randomization)
         .with_stream_interval(config.stream_interval);
-    let text = TextLlm::new(llm, text_backend).with_max_logprobs(config.max_logprobs);
+    let text = TextLlm::new(llm, text_backend)
+        .with_max_logprobs(config.max_logprobs)
+        .with_structured_outputs_backend(config.structured_outputs_backend);
 
     let chat = ChatLlm::new(text, chat_backend)
         .with_tool_call_parser(config.tool_call_parser.clone())
         .with_reasoning_parser(config.reasoning_parser.clone())
         .with_tool_strict_level(config.tool_strict_level)
+        .with_reasoning_effort_map(
+            config
+                .reasoning_effort_map
+                .iter()
+                .map(|(effort, value)| (effort.as_str().to_owned(), value.clone()))
+                .collect(),
+        )
         .with_exclude_tools_when_tool_choice_none(config.exclude_tools_when_tool_choice_none);
 
     let state = Arc::new(
         AppState::new(served_model_names, chat)
             .with_model_path(config.model.clone())
             .with_api_server_options(config.api_server_options)
-            .with_server_info(ServerInfoSnapshot::from_config(config))
+            .with_server_info(server_info)
             .with_api_keys(config.api_keys.clone())
             .with_cors(config.cors.clone())
             .with_profiler(config.profiler.clone()),
@@ -242,9 +253,8 @@ where
             .transpose()
             .context("invalid gRPC TLS configuration")?;
         let (health_reporter, health_service) = health_reporter();
-        let engine_health = state.engine_core_client().subscribe_health();
-        health_reporter.set_serving::<grpc::InferenceGrpcService>().await;
-        health_reporter.set_serving::<grpc::ControlGrpcService>().await;
+        let engine_health = grpc::EngineHealth::subscribe(state.engine_core_client());
+        let health_monitor = grpc::HealthMonitor::register(health_reporter, engine_health).await;
         let control_service = grpc::ControlGrpcService::new(
             grpc::ControlServiceImpl::new(state.clone())
                 .with_engine_shutdown(config.manages_engine.then(|| shutdown.clone())),
@@ -260,14 +270,7 @@ where
             .add_service(health_service)
             .add_service(control_service)
             .add_service(inference_service);
-        Some((
-            addr,
-            grpc_listener,
-            svc,
-            grpc_tls,
-            health_reporter,
-            engine_health,
-        ))
+        Some((addr, grpc_listener, svc, grpc_tls, health_monitor))
     } else {
         None
     };
@@ -356,9 +359,7 @@ where
         let server_shutdown = server_shutdown.clone();
         let force_shutdown = force_shutdown.clone();
         async move {
-            let Some((addr, grpc_listener, svc, grpc_tls, health_reporter, engine_health)) =
-                grpc_setup
-            else {
+            let Some((addr, grpc_listener, svc, grpc_tls, health_monitor)) = grpc_setup else {
                 // No gRPC configured: just wait for shutdown so we do not race the
                 // join! by resolving early and tripping the cancellation token.
                 shutdown.cancelled().await;
@@ -369,29 +370,21 @@ where
                 Some(context) => MaybeTlsListener::tls(grpc_listener, context),
                 None => MaybeTlsListener::plain(grpc_listener),
             };
-            let server =
-                svc.serve_with_incoming_shutdown(incoming, shutdown.clone().cancelled_owned());
-            let health_monitor = grpc::monitor_health(health_reporter, engine_health, shutdown);
+            let server = health_monitor.serve(shutdown, force_shutdown.cancelled(), |stop| {
+                let server = svc.serve_with_incoming_shutdown(incoming, stop);
+                async move {
+                    let result = server.await.context("gRPC server failed");
+                    server_shutdown.cancel();
+                    result
+                }
+            });
 
             info!(%addr, tls, model, "gRPC server is ready to accept requests");
 
-            let server = async move {
-                let result = tokio::select! {
-                    result = server => {
-                        result.context("gRPC server failed")
-                    }
-                    _ = force_shutdown.cancelled() => {
-                        warn!("gRPC graceful shutdown deadline elapsed; aborting server");
-                        Ok(())
-                    }
-                };
-
-                server_shutdown.cancel();
-                result
-            };
-
-            let (result, ()) = tokio::join!(server, health_monitor);
-            result
+            server.await.unwrap_or_else(|| {
+                warn!("gRPC graceful shutdown deadline elapsed; aborting server");
+                Ok(())
+            })
         }
     };
 
