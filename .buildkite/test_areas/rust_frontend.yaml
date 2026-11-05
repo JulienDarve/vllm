@@ -118,8 +118,7 @@ steps:
   - export VLLM_WORKER_MULTIPROC_METHOD=spawn
   - PYTHONPATH=/vllm-workspace pytest -v -s entrypoints/serve/dev/rpc/test_collective_rpc.py
   - pytest -v -s entrypoints/serve/instrumentator/test_basic.py
-  # The Rust LoRA request still carries the removed tensorizer_config_dict field, so --lora-modules fails at startup.
-  - pytest -v -s entrypoints/scale_out/token_in_token_out/test_serving_tokens.py -k "not lora"
+  - pytest -v -s entrypoints/scale_out/token_in_token_out/test_serving_tokens.py
   # run_batch drives the Python batch runner, not a server. test_metrics_exist needs
   # vllm:admission_rejections (text) and image inputs (multimodal), which the Rust frontend lacks.
   - pytest -v -s entrypoints/serve/instrumentator/test_metrics.py -k "not run_batch and not test_metrics_exist"
@@ -212,8 +211,7 @@ steps:
   # The Rust renderer rejects empty tool-call arguments in the history (Python treats them as {}).
   - pytest -v -s entrypoints/openai/chat_completion/test_completion_with_function_calling.py -k "not test_no_args_tool_call"
   - pytest -v -s entrypoints/tool_parsers/test_granite4_tool_parser.py
-  # The llama cases use --lora-modules, which fails at startup until the Rust LoRA request drops tensorizer_config_dict.
-  - pytest -v -s entrypoints/tool_parsers/test_hermes_tool_parser.py -k granite4
+  - pytest -v -s entrypoints/tool_parsers/test_hermes_tool_parser.py
   mirror:
     amd:
       automatic_shard: true
