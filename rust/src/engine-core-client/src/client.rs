@@ -604,6 +604,11 @@ impl EngineCoreClient {
             .dtype
     }
 
+    /// Whether the engine rescales and normalizes image pixels on device.
+    pub fn mm_device_do_normalize(&self) -> bool {
+        self.ready_response().mm_device_do_normalize
+    }
+
     /// Return the engine-reported Python vLLM version.
     pub fn vllm_version(&self) -> &str {
         self.engines

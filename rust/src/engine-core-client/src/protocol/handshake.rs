@@ -149,6 +149,10 @@ pub struct EngineCoreReadyResponse {
     /// `--kv-sharing-fast-prefill`, which skips prompt tokens in some layers.
     #[serde(default = "supports_prompt_logprobs_default")]
     pub supports_prompt_logprobs: bool,
+    /// Whether the engine rescales and normalizes image pixels on device and
+    /// so expects the images' own bytes.
+    #[serde(default)]
+    pub mm_device_do_normalize: bool,
 }
 
 fn supports_prompt_logprobs_default() -> bool {

@@ -47,7 +47,7 @@ impl MultimodalModelInfo {
             preprocessed,
             hashes,
             uuids,
-            ModelDtype::Float32,
+            ModelDtype::Float32.into(),
         )?;
 
         Ok(PreparedMedia {
@@ -248,7 +248,7 @@ mod tests {
             preprocessed,
             vec!["<hash>".to_string()],
             vec![None],
-            ModelDtype::Float32,
+            ModelDtype::Float32.into(),
         )
         .unwrap()
         .pop()
@@ -289,10 +289,15 @@ mod tests {
             mime_type: Some("audio/wav".to_string()),
             uuid: Some("audio-1".to_string()),
         }];
-        info.prepare_multimodal(parts, &mut vec![AUDIO_PAD_ID], ModelDtype::Float32, None)
-            .instrument(mm_request_span(REQUEST_ID))
-            .await
-            .unwrap();
+        info.prepare_multimodal(
+            parts,
+            &mut vec![AUDIO_PAD_ID],
+            ModelDtype::Float32.into(),
+            None,
+        )
+        .instrument(mm_request_span(REQUEST_ID))
+        .await
+        .unwrap();
 
         let mut stages = TIMINGS
             .stat()

@@ -12,14 +12,15 @@ use llm_multimodal::{
 };
 use thiserror_ext::AsReport as _;
 use tracing::warn;
-use vllm_engine_core_client::protocol::dtype::ModelDtype;
 use vllm_engine_core_client::protocol::multimodal::{
     MmBatchedField, MmField, MmFieldElem, MmFlatField, MmKwargsItem, MmSharedField, MmSlice,
     SliceSpec,
 };
 
 use super::timing::MM_STAGE_TARGET;
-use super::{MultimodalModelInfo, PreparedItem, PreparedMedia, VisionModalitySupport, tensor};
+use super::{
+    MediaEncoding, MultimodalModelInfo, PreparedItem, PreparedMedia, VisionModalitySupport, tensor,
+};
 use crate::error::{Error, Result, bail_multimodal, multimodal};
 
 /// Forward-kwargs name of the primary video encoder input.
@@ -45,7 +46,7 @@ impl MultimodalModelInfo {
         &self,
         clips: Vec<Arc<VideoClip>>,
         uuids: Vec<Option<String>>,
-        model_dtype: ModelDtype,
+        encoding: MediaEncoding,
     ) -> Result<PreparedMedia> {
         let support = self.video.as_ref().ok_or_else(|| Error::UnsupportedModality {
             modality: Modality::Video.to_string(),
@@ -81,7 +82,7 @@ impl MultimodalModelInfo {
                 preprocessed,
                 clip.hash.clone(),
                 uuid,
-                model_dtype,
+                encoding,
             )?);
         }
 
@@ -149,9 +150,9 @@ fn build_video_item(
     preprocessed: PreprocessedEncoderInputs,
     hash: String,
     uuid: Option<String>,
-    model_dtype: ModelDtype,
+    encoding: MediaEncoding,
 ) -> Result<PreparedItem> {
-    let tensors = tensor::collect_tensors(preprocessed, support.spec.primary_key(), model_dtype)?;
+    let tensors = tensor::collect_tensors(preprocessed, support.spec.primary_key(), encoding)?;
 
     let mut data = MmKwargsItem::new();
     for (key, tensor) in tensors {
@@ -206,6 +207,7 @@ mod tests {
 
     use llm_multimodal::ModelSpecificValue;
     use ndarray::ArrayD;
+    use vllm_engine_core_client::protocol::dtype::ModelDtype;
     use vllm_engine_core_client::protocol::multimodal::MmKwargValue;
 
     use super::super::tests::{
@@ -318,7 +320,7 @@ mod tests {
             preprocessed,
             "<hash>".to_string(),
             None,
-            ModelDtype::Float32,
+            ModelDtype::Float32.into(),
         )
         .unwrap();
 
@@ -381,12 +383,12 @@ mod tests {
                     frame_indices: vec![0, 8, 17, 26, 35, 44, 53, 62],
                 }))],
                 vec![None],
-                ModelDtype::Float32,
+                ModelDtype::Float32.into(),
             )
             .await
             .unwrap();
         let fallback = info
-            .prepare_videos(vec![clip(None)], vec![None], ModelDtype::Float32)
+            .prepare_videos(vec![clip(None)], vec![None], ModelDtype::Float32.into())
             .await
             .unwrap();
 

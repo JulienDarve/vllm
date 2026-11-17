@@ -74,12 +74,14 @@ use vllm_llm::Llm;
 use vllm_metrics::{METRICS, RenderRequestType};
 use vllm_text::{Prompt, TextLlm, TextRequest, TextRequestProcessor};
 
+use crate::multimodal::MediaEncoding;
+
 /// Chat request preparation shared by inference and render-only frontends.
 pub struct ChatRequestProcessor {
     backend: DynChatBackend,
-    /// Effective model dtype that media tensors are encoded in; multimodal
-    /// requests are rejected without one.
-    model_dtype: Option<ModelDtype>,
+    /// How media tensors are encoded for the engine; multimodal requests are
+    /// rejected without it.
+    media_encoding: Option<MediaEncoding>,
     /// Effective runtime context length. Absent for render-only frontends
     /// without a configured `--max-model-len`.
     max_model_len: Option<usize>,
@@ -110,13 +112,31 @@ impl ChatRequestProcessor {
     ) -> Self {
         Self {
             backend,
-            model_dtype,
+            media_encoding: model_dtype.map(MediaEncoding::from),
             max_model_len: max_model_len.map(|len| len as usize),
             tool_call_parser: ParserSelection::Auto,
             reasoning_parser: ParserSelection::Auto,
             tool_strict_level: None,
             reasoning_effort_map: HashMap::new(),
             exclude_tools_when_tool_choice_none: false,
+        }
+    }
+
+    /// Send image pixels as their own bytes when the engine normalizes them on
+    /// device.
+    fn with_pixel_bytes(mut self, pixel_bytes: bool) -> Self {
+        if let Some(encoding) = &mut self.media_encoding {
+            encoding.pixel_bytes = pixel_bytes;
+        }
+        self
+    }
+
+    /// Check that the model's vision preprocessors can encode media as the
+    /// engine expects.
+    pub fn check_media_encoding(&self) -> Result<()> {
+        match (self.media_encoding, self.backend.multimodal_model_info()) {
+            (Some(encoding), Some(info)) => info.check_media_encoding(encoding),
+            _ => Ok(()),
         }
     }
 
@@ -172,13 +192,13 @@ impl ChatRequestProcessor {
             Some(media_order) => media_order.is_empty(),
             None => !request.has_multimodal(),
         };
-        match self.model_dtype {
-            Some(model_dtype) => {
+        match self.media_encoding {
+            Some(encoding) => {
                 multimodal::finalize_rendered_prompt(
                     request,
                     rendered,
                     self.backend.multimodal_model_info(),
-                    model_dtype,
+                    encoding,
                     self.max_model_len,
                 )
                 .await
@@ -204,15 +224,9 @@ impl ChatRequestProcessor {
         let multimodal::MultimodalInput { preprocessed, raw } = media;
         let mut features = info.prepare_preprocessed(preprocessed, token_ids.len())?;
         if !raw.is_empty() {
-            let model_dtype = self.model_dtype.ok_or(Error::UnsupportedMultimodalRenderer)?;
-            info.append_multimodal(
-                &mut features,
-                raw,
-                token_ids,
-                model_dtype,
-                self.max_model_len,
-            )
-            .await?;
+            let encoding = self.media_encoding.ok_or(Error::UnsupportedMultimodalRenderer)?;
+            info.append_multimodal(&mut features, raw, token_ids, encoding, self.max_model_len)
+                .await?;
         }
         Ok(Some(features))
     }
@@ -366,7 +380,8 @@ impl ChatLlm {
     pub fn new(text: TextLlm, backend: DynChatBackend) -> Self {
         let info = text.llm().info();
         let processor =
-            ChatRequestProcessor::new(backend, info.model_dtype, Some(info.max_model_len));
+            ChatRequestProcessor::new(backend, info.model_dtype, Some(info.max_model_len))
+                .with_pixel_bytes(info.mm_device_do_normalize);
 
         Self { text, processor }
     }
@@ -420,9 +435,20 @@ impl ChatLlm {
         self
     }
 
+    /// Check that the model's vision preprocessors can encode media as the
+    /// engine expects; see [`ChatRequestProcessor::check_media_encoding`].
+    pub fn check_media_encoding(&self) -> Result<()> {
+        self.processor.check_media_encoding()
+    }
+
     /// Override the effective model dtype used for multimodal tensor encoding.
     pub fn with_model_dtype(mut self, model_dtype: ModelDtype) -> Self {
-        self.processor.model_dtype = Some(model_dtype);
+        let pixel_bytes =
+            (self.processor.media_encoding).is_some_and(|encoding| encoding.pixel_bytes);
+        self.processor.media_encoding = Some(MediaEncoding {
+            model_dtype,
+            pixel_bytes,
+        });
         self
     }
 

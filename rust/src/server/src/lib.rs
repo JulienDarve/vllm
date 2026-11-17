@@ -192,6 +192,7 @@ async fn build_state(config: &Config) -> Result<Arc<AppState>> {
                 .collect(),
         )
         .with_exclude_tools_when_tool_choice_none(config.exclude_tools_when_tool_choice_none);
+    chat.check_media_encoding().context("unsupported multimodal input encoding")?;
 
     let state = Arc::new(
         AppState::new(served_model_names, chat)

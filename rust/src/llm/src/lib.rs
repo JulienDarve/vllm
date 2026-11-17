@@ -55,6 +55,9 @@ pub struct LlmInfo {
     /// Effective model dtype, used to encode multimodal tensors. `None` when
     /// it is not reported, which disables multimodal inputs.
     pub model_dtype: Option<ModelDtype>,
+    /// Whether the engine rescales and normalizes image pixels on device, so
+    /// pixel tensors carry the images' own bytes.
+    pub mm_device_do_normalize: bool,
     /// Whether the engine was started with LoRA support.
     pub supports_lora: bool,
     /// vLLM version of the engine.
@@ -158,6 +161,7 @@ impl EngineCoreLlm {
         let info = LlmInfo {
             max_model_len: client.max_model_len(),
             model_dtype: Some(client.model_dtype()),
+            mm_device_do_normalize: client.mm_device_do_normalize(),
             supports_lora: client.ready_response().supports_lora,
             vllm_version: client.vllm_version().to_string(),
         };

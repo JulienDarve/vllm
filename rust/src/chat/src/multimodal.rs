@@ -109,6 +109,25 @@ impl MmLimitSpec {
     }
 }
 
+/// How media tensors are encoded for the engine, as its handshake reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaEncoding {
+    /// Effective model dtype that float tensors are encoded in.
+    pub model_dtype: ModelDtype,
+    /// Whether the engine rescales and normalizes image pixels on device, so
+    /// pixel tensors carry the images' own bytes.
+    pub pixel_bytes: bool,
+}
+
+impl From<ModelDtype> for MediaEncoding {
+    fn from(model_dtype: ModelDtype) -> Self {
+        Self {
+            model_dtype,
+            pixel_bytes: false,
+        }
+    }
+}
+
 /// Model metadata and tokenizer access shared by all multimodal specs.
 #[derive(Clone)]
 struct MultimodalModelContext {
@@ -635,7 +654,7 @@ pub(crate) async fn finalize_rendered_prompt(
     request: &ChatRequest,
     rendered: RenderedPrompt,
     info: Option<&MultimodalModelInfo>,
-    model_dtype: ModelDtype,
+    encoding: MediaEncoding,
     max_model_len: Option<usize>,
 ) -> Result<(Prompt, Option<MmFeatures>)> {
     let media_parts = extract_media_parts(request, rendered.media_order.as_deref())?;
@@ -652,12 +671,7 @@ pub(crate) async fn finalize_rendered_prompt(
         Prompt::TokenIds(token_ids) => token_ids,
     };
     let prepared = info
-        .prepare_multimodal(
-            media_parts,
-            &mut prompt_token_ids,
-            model_dtype,
-            max_model_len,
-        )
+        .prepare_multimodal(media_parts, &mut prompt_token_ids, encoding, max_model_len)
         .instrument(mm_request_span(&request.request_id))
         .await?;
 
@@ -859,7 +873,7 @@ impl MultimodalModelInfo {
         features: &mut MmFeatures,
         media_parts: Vec<MediaContentPart>,
         prompt_token_ids: &mut Vec<u32>,
-        model_dtype: ModelDtype,
+        encoding: MediaEncoding,
         max_model_len: Option<usize>,
     ) -> Result<()> {
         let start = features
@@ -881,7 +895,7 @@ impl MultimodalModelInfo {
             .prepare_multimodal(
                 media_parts,
                 &mut tail,
-                model_dtype,
+                encoding,
                 max_model_len.map(|limit| limit.saturating_sub(start)),
             )
             .await;
@@ -903,6 +917,29 @@ impl MultimodalModelInfo {
         Ok(())
     }
 
+    /// Check that the vision preprocessors can encode media as `encoding`
+    /// asks: an engine that normalizes on device needs the images' own bytes.
+    pub(crate) fn check_media_encoding(&self, encoding: MediaEncoding) -> Result<()> {
+        if !encoding.pixel_bytes {
+            return Ok(());
+        }
+        for (modality, support) in [
+            (Modality::Image, &self.image),
+            (Modality::Video, &self.video),
+        ] {
+            if let Some(support) = support
+                && !support.processor.emits_pixel_bytes()
+            {
+                bail_multimodal!(
+                    "the engine normalizes {modality} pixels on device, but this model's \
+                     {modality} preprocessor produces normalized floats; start the engine with \
+                     `--no-mm-device-do-normalize`"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Run media fetch, per-modality preprocessing, prompt expansion, and
     /// feature build.
     ///
@@ -918,13 +955,13 @@ impl MultimodalModelInfo {
         &self,
         media_parts: Vec<MediaContentPart>,
         prompt_token_ids: &mut Vec<u32>,
-        model_dtype: ModelDtype,
+        encoding: MediaEncoding,
         max_model_len: Option<usize>,
     ) -> Result<MmFeatures> {
         if media_parts.is_empty() {
             return Ok(Vec::new());
         }
-        self.prepare_multimodal_timed(media_parts, prompt_token_ids, model_dtype, max_model_len)
+        self.prepare_multimodal_timed(media_parts, prompt_token_ids, encoding, max_model_len)
             .await
     }
 
@@ -940,7 +977,7 @@ impl MultimodalModelInfo {
         &self,
         media_parts: Vec<MediaContentPart>,
         prompt_token_ids: &mut Vec<u32>,
-        model_dtype: ModelDtype,
+        encoding: MediaEncoding,
         max_model_len: Option<usize>,
     ) -> Result<MmFeatures> {
         let media_parts_len = media_parts.len();
@@ -954,7 +991,7 @@ impl MultimodalModelInfo {
                 self.prepare_images(
                     fetched.images,
                     fetched.image_uuids,
-                    model_dtype,
+                    encoding,
                     vision_context,
                 )
                 .await?,
@@ -962,7 +999,7 @@ impl MultimodalModelInfo {
         }
         if !fetched.videos.is_empty() {
             prepared
-                .push(self.prepare_videos(fetched.videos, fetched.video_uuids, model_dtype).await?);
+                .push(self.prepare_videos(fetched.videos, fetched.video_uuids, encoding).await?);
         }
         if !fetched.audios.is_empty() {
             prepared.push(self.prepare_audios(fetched.audios, fetched.audio_uuids).await?);
@@ -1162,6 +1199,7 @@ impl TokenResolver for TokenizerResolver {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use vllm_tokenizer::test_utils::TestTokenizer;
@@ -1450,7 +1488,7 @@ mod tests {
             };
             let mut tokens = vec![11, QWEN3_IMAGE_PAD_ID, 12];
             let mut features = info
-                .prepare_multimodal(vec![media], &mut tokens, ModelDtype::Float32, None)
+                .prepare_multimodal(vec![media], &mut tokens, ModelDtype::Float32.into(), None)
                 .await
                 .unwrap();
             features.remove(0).data
@@ -1459,6 +1497,47 @@ mod tests {
         let transparent = encoder_input([0, 0, 0, 0]).await;
         assert_eq!(transparent, encoder_input([255, 255, 255, 255]).await);
         assert_ne!(transparent, encoder_input([0, 0, 0, 255]).await);
+    }
+
+    /// An engine that normalizes on device gets the images' own bytes, which
+    /// a preprocessor that only produces normalized floats cannot serve.
+    #[tokio::test]
+    async fn device_normalizing_engine_gets_pixel_bytes() {
+        use vllm_engine_core_client::protocol::multimodal::MmKwargValue;
+
+        let encoding = MediaEncoding {
+            model_dtype: ModelDtype::BFloat16,
+            pixel_bytes: true,
+        };
+        let mut png = Vec::new();
+        ::image::RgbImage::from_pixel(32, 32, ::image::Rgb([200, 100, 50]))
+            .write_to(
+                &mut std::io::Cursor::new(&mut png),
+                ::image::ImageFormat::Png,
+            )
+            .unwrap();
+        let media = MediaContentPart::ImageData {
+            data: png,
+            mime_type: Some("image/png".to_string()),
+            uuid: None,
+            detail: None,
+        };
+        let info = qwen3_vl_info();
+        info.check_media_encoding(encoding).unwrap();
+        let mut tokens = vec![11, QWEN3_IMAGE_PAD_ID, 12];
+        let features =
+            info.prepare_multimodal(vec![media], &mut tokens, encoding, None).await.unwrap();
+        let Some(MmKwargValue::Tensor(pixel_values)) =
+            features[0].data.as_ref().unwrap()["pixel_values"].data.clone()
+        else {
+            panic!("pixel_values should be a tensor");
+        };
+        assert_eq!(pixel_values.dtype.as_str(), "uint8");
+        let bytes: BTreeSet<u8> = pixel_values.data.into_raw_view().unwrap().into_iter().collect();
+        assert_eq!(bytes, BTreeSet::from([50, 100, 200]));
+
+        let error = nemotron_omni_info().check_media_encoding(encoding).unwrap_err();
+        expect_test::expect!["multimodal preprocessing error: the engine normalizes image pixels on device, but this model's image preprocessor produces normalized floats; start the engine with `--no-mm-device-do-normalize`"].assert_eq(&error.to_report_string());
     }
 
     /// A processor that handles the alpha channel itself gets the image as
@@ -1568,7 +1647,7 @@ mod tests {
         tokens.push(1018);
 
         let features = info
-            .prepare_multimodal(vec![media], &mut tokens, ModelDtype::Float32, None)
+            .prepare_multimodal(vec![media], &mut tokens, ModelDtype::Float32.into(), None)
             .await
             .unwrap();
         assert_eq!(features.len(), 1);
@@ -1625,7 +1704,7 @@ mod tests {
                 .prepare_multimodal(
                     vec![png_640x480()],
                     &mut tokens,
-                    ModelDtype::Float32,
+                    ModelDtype::Float32.into(),
                     max_model_len,
                 )
                 .await
@@ -1662,7 +1741,12 @@ mod tests {
         let mut tokens = vec![11; 100];
         tokens.push(1018);
         let features = info
-            .prepare_multimodal(vec![png_640x480()], &mut tokens, ModelDtype::Float32, None)
+            .prepare_multimodal(
+                vec![png_640x480()],
+                &mut tokens,
+                ModelDtype::Float32.into(),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(tokens.len(), 402);
@@ -1681,7 +1765,7 @@ mod tests {
             &mut features,
             vec![png_640x480()],
             &mut tokens,
-            ModelDtype::Float32,
+            ModelDtype::Float32.into(),
             Some(402 + 303),
         )
         .await
@@ -1712,7 +1796,7 @@ mod tests {
                 &mut features,
                 vec![png_640x480()],
                 &mut tokens,
-                ModelDtype::Float32,
+                ModelDtype::Float32.into(),
                 None,
             )
             .await
@@ -1876,8 +1960,10 @@ mod tests {
             "video".to_owned(),
             2.0,
         ));
-        let prepared =
-            info.prepare_videos(vec![clip], vec![None], ModelDtype::Float32).await.unwrap();
+        let prepared = info
+            .prepare_videos(vec![clip], vec![None], ModelDtype::Float32.into())
+            .await
+            .unwrap();
         let token_ids =
             prepared.replacements[0].tokens.iter().map(|&id| id as u32).collect::<Vec<_>>();
         // Two frames uniformly sampled at 2 fps with temporal_patch_size=2

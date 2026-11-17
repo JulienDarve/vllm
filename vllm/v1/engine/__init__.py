@@ -163,6 +163,9 @@ class EngineCoreReadyResponse:
     # VllmConfig (the Rust frontend). False under --kv-sharing-fast-prefill,
     # which skips prompt tokens in some layers.
     supports_prompt_logprobs: bool = True
+    # Whether the engine rescales and normalizes image pixels on device, so a
+    # frontend without a VllmConfig (the Rust frontend) sends the raw pixels.
+    mm_device_do_normalize: bool = False
 
 
 class EngineCoreRequest(

@@ -5,12 +5,13 @@ use std::collections::HashMap;
 use std::mem::size_of;
 
 use half::{bf16, f16};
-use llm_multimodal::{ModelSpecificValue, PreprocessedEncoderInputs};
+use llm_multimodal::{EncoderDtype, ModelSpecificValue, PreprocessedEncoderInputs};
 use ndarray::ArrayD;
 use vllm_engine_core_client::protocol::dtype::{ModelDtype, TensorDtype};
 use vllm_engine_core_client::protocol::multimodal::MmKwargValue as ProtocolKwargValue;
 use vllm_engine_core_client::protocol::tensor::{WireArrayData, WireTensor};
 
+use super::MediaEncoding;
 use crate::error::{Error, Result, bail_multimodal, multimodal};
 
 /// Representation for multimodal kwarg values for transformation.
@@ -27,11 +28,12 @@ pub(super) enum KwargValue {
 ///
 /// `primary_key` names the encoder-input tensor as the model's forward kwargs
 /// expect it (e.g. `pixel_values` for images, `pixel_values_videos` for
-/// videos).
+/// videos). With [`MediaEncoding::pixel_bytes`], pixel inputs are sent as the
+/// images' own bytes for the engine to normalize on device.
 pub(super) fn collect_tensors(
     preprocessed: PreprocessedEncoderInputs,
     primary_key: &str,
-    float_dtype: ModelDtype,
+    encoding: MediaEncoding,
 ) -> Result<HashMap<String, KwargValue>> {
     let PreprocessedEncoderInputs {
         encoder_input,
@@ -39,12 +41,29 @@ pub(super) fn collect_tensors(
         ..
     } = preprocessed;
 
-    let primary_value = KwargValue::from_f32_array(encoder_input.into_f32(), float_dtype)?;
+    let primary_value = match (encoding.pixel_bytes, encoder_input.pixel_norm()) {
+        (true, Some(_)) => {
+            let shape = encoder_input.shape().to_vec();
+            let bytes =
+                (encoder_input.into_bytes_as(EncoderDtype::Uint8)).map_err(Error::Multimodal)?;
+            KwargValue::Tensor {
+                wire: WireTensor::from_raw(TensorDtype::U8, shape, bytes),
+            }
+        }
+        (true, None) => bail_multimodal!(
+            "the engine normalizes `{primary_key}` on device, but the preprocessor produced \
+             normalized floats"
+        ),
+        (false, _) => KwargValue::from_f32_array(encoder_input.into_f32(), encoding.model_dtype)?,
+    };
 
     let mut tensors = HashMap::new();
     tensors.insert(primary_key.to_string(), primary_value);
     for (key, value) in model_specific {
-        tensors.insert(key, KwargValue::from_model_specific(value, float_dtype)?);
+        tensors.insert(
+            key,
+            KwargValue::from_model_specific(value, encoding.model_dtype)?,
+        );
     }
     Ok(tensors)
 }
@@ -307,7 +326,7 @@ mod tests {
             let shape = array.shape().to_vec();
             let preprocessed = PreprocessedEncoderInputs::new(array, vec![6], vec![(3, 2)]);
             let tensors =
-                collect_tensors(preprocessed, "pixel_values", ModelDtype::Float32).unwrap();
+                collect_tensors(preprocessed, "pixel_values", ModelDtype::Float32.into()).unwrap();
 
             let ProtocolKwargValue::Tensor(tensor) =
                 ProtocolKwargValue::try_from(&tensors["pixel_values"]).unwrap()

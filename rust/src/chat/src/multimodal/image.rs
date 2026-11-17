@@ -7,10 +7,9 @@
 use std::sync::Arc;
 
 use llm_multimodal::{ImageFrame, Modality, PreprocessedEncoderInputs, VisionPreprocessingContext};
-use vllm_engine_core_client::protocol::dtype::ModelDtype;
 
 use super::timing::MM_STAGE_TARGET;
-use super::{MultimodalModelInfo, PreparedMedia, VisionModalitySupport, item};
+use super::{MediaEncoding, MultimodalModelInfo, PreparedMedia, VisionModalitySupport, item};
 use crate::error::{Error, Result, bail_multimodal, multimodal};
 
 /// Forward-kwargs name of the primary image encoder input.
@@ -29,7 +28,7 @@ impl MultimodalModelInfo {
         &self,
         frames: Vec<Arc<ImageFrame>>,
         uuids: Vec<Option<String>>,
-        model_dtype: ModelDtype,
+        encoding: MediaEncoding,
         preprocessing_context: VisionPreprocessingContext,
     ) -> Result<PreparedMedia> {
         let support = self.image.as_ref().ok_or_else(|| Error::UnsupportedModality {
@@ -46,7 +45,7 @@ impl MultimodalModelInfo {
         }
         let hashes = frames.iter().map(|frame| frame.hash.clone()).collect();
         let items =
-            item::build_batched_items(&support.spec, preprocessed, hashes, uuids, model_dtype)?;
+            item::build_batched_items(&support.spec, preprocessed, hashes, uuids, encoding)?;
 
         Ok(PreparedMedia {
             modality: Modality::Image,

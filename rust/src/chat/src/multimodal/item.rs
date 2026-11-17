@@ -5,13 +5,12 @@
 
 use itertools::izip;
 use llm_multimodal::{FieldLayout, PreprocessedEncoderInputs};
-use vllm_engine_core_client::protocol::dtype::ModelDtype;
 use vllm_engine_core_client::protocol::multimodal::{
     MmBatchedField, MmField, MmFieldElem, MmFlatField, MmKwargsItem, MmSharedField, MmSlice,
     SliceSpec,
 };
 
-use super::{PreparedItem, ResolvedMultimodalSpec, tensor};
+use super::{MediaEncoding, PreparedItem, ResolvedMultimodalSpec, tensor};
 use crate::error::{Result, bail_multimodal, multimodal};
 
 /// Split one batch of preprocessed tensors into engine kwargs per media item.
@@ -20,7 +19,7 @@ pub(super) fn build_batched_items(
     preprocessed: PreprocessedEncoderInputs,
     hashes: Vec<String>,
     uuids: Vec<Option<String>>,
-    float_dtype: ModelDtype,
+    encoding: MediaEncoding,
 ) -> Result<Vec<PreparedItem>> {
     let len = hashes.len();
     if uuids.len() != len {
@@ -29,7 +28,7 @@ pub(super) fn build_batched_items(
             uuids.len()
         );
     }
-    let tensors = tensor::collect_tensors(preprocessed, spec.primary_key(), float_dtype)?;
+    let tensors = tensor::collect_tensors(preprocessed, spec.primary_key(), encoding)?;
 
     let mut items = Vec::with_capacity(len);
     for (index, (hash, uuid)) in izip!(hashes, uuids).enumerate() {
