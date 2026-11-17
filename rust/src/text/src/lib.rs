@@ -253,11 +253,6 @@ impl TextLlm {
         self.processor.backend.model_id()
     }
 
-    /// Return the model-derived defaults for omitted sampling parameters.
-    pub fn sampling_hints(&self) -> Result<SamplingHints> {
-        self.processor.backend.sampling_hints()
-    }
-
     /// Expose the underlying [`Llm`].
     pub fn llm(&self) -> &dyn Llm {
         self.llm.as_ref()

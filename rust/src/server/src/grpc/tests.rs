@@ -1774,6 +1774,52 @@ async fn unary_generate_with_sampling_params() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn unary_generate_without_temperature_uses_model_default() {
+    let (inference_service, control_service, engine_health, engine_task) =
+        setup_grpc_service_with_backend(
+            b"engine-grpc-default-temperature",
+            default_stream_output_specs(),
+            Arc::new(FakeTextBackend {
+                sampling_hints: SamplingHints {
+                    default_temperature: Some(0.6),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            |request| {
+                let params = request.sampling_params.as_ref().expect("sampling params");
+                assert_eq!(params.temperature, 0.6);
+            },
+        )
+        .await;
+    let (channel, server_task) = start_grpc_test_server(
+        inference_service,
+        control_service,
+        engine_health,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+
+    InferenceClient::new(channel)
+        .generate(pb::GenerateRequest {
+            request_id: "test-default-temperature".to_string(),
+            model: "test-model".to_string(),
+            prompt: Some(pb::generate_request::Prompt::Text("test".to_string())),
+            stopping: Some(pb::StoppingCriteria {
+                max_new_tokens: 5,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("generate without temperature");
+
+    engine_task.await.expect("mock engine task");
+    server_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn unary_generate_rejects_wrong_model() {
     let (mut client, server_task, _engine_task) =
         grpc_test_server(b"engine-grpc-wrong-model", default_stream_output_specs()).await;
@@ -2218,13 +2264,7 @@ async fn control_reports_server_and_model_info() {
         setup_grpc_service_with_engine_script(
             b"engine-grpc-info".to_vec(),
             ready,
-            Arc::new(FakeTextBackend {
-                sampling_hints: SamplingHints {
-                    default_temperature: Some(0.6),
-                    ..Default::default()
-                },
-                ..Default::default()
-            }),
+            Arc::new(FakeTextBackend::default()),
             None,
             |_, _| boxed_test_future(async {}),
         )
@@ -2279,7 +2319,6 @@ async fn control_reports_server_and_model_info() {
     assert!(!model.supports_multimodal);
     assert!(model.reasoning_parser.is_empty());
     assert!(model.tool_call_parser.is_empty());
-    assert_eq!(model.default_temperature, Some(0.6));
 
     server_task.abort();
 }

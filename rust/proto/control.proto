@@ -89,10 +89,6 @@ message ModelInfo {
   bool supports_multimodal = 23;
   string reasoning_parser = 24;
   string tool_call_parser = 25;
-  // Temperature from the model's generation config, which the HTTP API applies
-  // when a request omits it. Absent if the config sets none or with
-  // `--generation-config vllm`. GenerateRequest does not apply it.
-  optional float default_temperature = 26;
 }
 
 message ShutdownRequest {}
