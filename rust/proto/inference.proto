@@ -27,7 +27,7 @@ message GenerateRequest {
     TokenIds token_ids = 4;
   }
 
-  // Temperature, defaults to model-specific default or 0
+  // Temperature, defaults to 0 (greedy); see ModelInfo.default_temperature
   optional float temperature = 5;
   // Parameters controlling random sampling, not applicable if temperature == 0
   RandomSampling sampling = 6;

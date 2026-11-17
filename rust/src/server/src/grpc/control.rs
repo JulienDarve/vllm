@@ -228,8 +228,12 @@ impl pb::control_server::Control for ControlServiceImpl {
         _request: Request<pb::GetModelInfoRequest>,
     ) -> Result<Response<pb::ModelInfo>, Status> {
         let served = self.state.served_model_names();
+        let text = self.state.chat.text();
+        let sampling_hints = text
+            .sampling_hints()
+            .map_err(|error| Status::internal(error.to_report_string()))?;
         Ok(Response::new(pb::ModelInfo {
-            model_id: self.state.chat.text().model_id().to_string(),
+            model_id: text.model_id().to_string(),
             served_model_name: self.state.primary_model_name().to_string(),
             served_model_aliases: served.iter().skip(1).cloned().collect(),
             // GenerateRequest accepts both prompt representations.
@@ -249,6 +253,7 @@ impl pb::control_server::Control for ControlServiceImpl {
                 .tool_call_parser_name()
                 .unwrap_or_default()
                 .to_string(),
+            default_temperature: sampling_hints.default_temperature,
         }))
     }
 

@@ -56,7 +56,7 @@ use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig, EngineId
 use vllm_llm::EngineCoreLlm;
 use vllm_metrics::METRICS;
 use vllm_text::tokenizer::DynTokenizer;
-use vllm_text::{Prompt, TextBackend, TextRequestProcessor};
+use vllm_text::{Prompt, SamplingHints, TextBackend, TextRequestProcessor};
 use vllm_tokenizer::test_utils::{PanickingTokenizer, TestTokenizer};
 use zeromq::prelude::{SocketRecv, SocketSend};
 use zeromq::{DealerSocket, PushSocket, ZmqMessage};
@@ -230,12 +230,14 @@ async fn recv_engine_message(dealer: &mut DealerSocket) -> Vec<bytes::Bytes> {
 #[derive(Clone)]
 struct FakeTextBackend {
     tokenizer: DynTokenizer,
+    sampling_hints: SamplingHints,
 }
 
 impl Default for FakeTextBackend {
     fn default() -> Self {
         Self {
             tokenizer: Arc::new(TestTokenizer::new()),
+            sampling_hints: SamplingHints::default(),
         }
     }
 }
@@ -247,6 +249,10 @@ impl TextBackend for FakeTextBackend {
 
     fn model_id(&self) -> &str {
         "test-model"
+    }
+
+    fn sampling_hints(&self) -> vllm_text::Result<SamplingHints> {
+        Ok(self.sampling_hints.clone())
     }
 }
 
@@ -857,6 +863,7 @@ async fn generate_without_output_text_skips_detokenization() {
                 default_stream_output_specs(),
                 Arc::new(FakeTextBackend {
                     tokenizer: Arc::new(PanickingTokenizer),
+                    ..Default::default()
                 }),
                 |_| {},
             )
@@ -2211,7 +2218,13 @@ async fn control_reports_server_and_model_info() {
         setup_grpc_service_with_engine_script(
             b"engine-grpc-info".to_vec(),
             ready,
-            Arc::new(FakeTextBackend::default()),
+            Arc::new(FakeTextBackend {
+                sampling_hints: SamplingHints {
+                    default_temperature: Some(0.6),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
             None,
             |_, _| boxed_test_future(async {}),
         )
@@ -2266,6 +2279,7 @@ async fn control_reports_server_and_model_info() {
     assert!(!model.supports_multimodal);
     assert!(model.reasoning_parser.is_empty());
     assert!(model.tool_call_parser.is_empty());
+    assert_eq!(model.default_temperature, Some(0.6));
 
     server_task.abort();
 }
