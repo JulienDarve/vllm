@@ -511,8 +511,9 @@ fn positions_to_proto(
             ranks.push(first.rank);
         }
 
-        // Extra candidates beyond the first.
-        let entries = pos.entries.iter().skip(1);
+        // Extra candidates beyond the first, which the engine row may repeat.
+        let first_id = pos.entries.first().map(|e| e.token_id);
+        let entries = pos.entries.iter().skip(1).filter(|e| Some(e.token_id) != first_id);
         candidates.push(pb::CandidateTokenInfo {
             tokens: entries
                 .map(|e| pb::candidate_token_info::TokenInfo {
@@ -624,7 +625,8 @@ mod tests {
     use vllm_engine_core_client::protocol::sampling_mask::SamplingMask;
     use vllm_engine_core_client::protocol::structured_outputs::StructuredOutputBackend;
     use vllm_text::{
-        FinishReason, Finished, Prompt, SamplingHints, SamplingLimits, lower_sampling_params,
+        DecodedLogprobs, DecodedPositionLogprobs, DecodedTokenLogprob, FinishReason, Finished,
+        Prompt, SamplingHints, SamplingLimits, lower_sampling_params,
     };
     use vllm_tokenizer::test_utils::TestTokenizer;
 
@@ -1174,6 +1176,39 @@ mod tests {
         assert_eq!(finish.finish_reason, PbFinishReason::Stop as i32);
         assert_eq!(finish.stop_reason, Some(PbStopReason::EosTokenId(30)));
         assert_eq!(finish.num_cached_tokens, Some(5));
+    }
+
+    #[test]
+    fn candidate_tokens_exclude_the_sampled_token() {
+        let position = |ids: &[u32]| DecodedPositionLogprobs {
+            entries: ids
+                .iter()
+                .map(|&token_id| DecodedTokenLogprob {
+                    token_id,
+                    token: String::new(),
+                    logprob: -1.0,
+                    rank: 1,
+                })
+                .collect(),
+        };
+        // Engine rows are the sampled token followed by the top 2.
+        let logprobs = DecodedLogprobs {
+            positions: vec![position(&[5, 5, 7]), position(&[8, 5, 7])],
+        };
+        let opts = ResponseOpts {
+            output_logprobs: true,
+            ..Default::default()
+        };
+
+        let out = to_sequence_output("", &[5, 8], Some(&logprobs), None, None, &opts)
+            .expect("sequence output");
+
+        let candidate_ids: Vec<Vec<u32>> = out
+            .candidate_tokens
+            .iter()
+            .map(|c| c.tokens.iter().map(|t| t.id).collect())
+            .collect();
+        assert_eq!(candidate_ids, vec![vec![7], vec![5, 7]]);
     }
 
     #[test]
