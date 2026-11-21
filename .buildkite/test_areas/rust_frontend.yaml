@@ -349,6 +349,7 @@ steps:
   - vllm/multimodal/
   - tests/utils.py
   - tests/entrypoints/multimodal/conftest.py
+  - tests/entrypoints/multimodal/openai/chat_completion/test_video.py
   - tests/entrypoints/multimodal/openai/chat_completion/test_vision.py
   - tests/entrypoints/multimodal/openai/responses/test_image.py
   - tests/entrypoints/scale_out/render/test_render_multimodal.py
@@ -374,6 +375,9 @@ steps:
     --deselect=tests/entrypoints/multimodal/openai/chat_completion/test_vision.py::test_multi_image_input[image_urls0-
     --deselect=tests/entrypoints/multimodal/openai/chat_completion/test_vision.py::test_single_chat_session_image_base64encoded[
     --deselect=tests/entrypoints/multimodal/openai/chat_completion/test_vision.py::test_chat_rejects_icns_image[
+  # The other video cases start a server with --media-io-kwargs and --trust-request-mm-kwargs,
+  # which the Rust frontend does not implement.
+  - pytest -v -s entrypoints/multimodal/openai/chat_completion/test_video.py::test_qwen3_vl_single_video
   # Image URLs on the local asset server: Rust refuses loopback media hosts (#65348).
   - >-
     pytest -v -s
