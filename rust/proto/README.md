@@ -82,3 +82,21 @@ end the stream with `DATA_LOSS`.
 Each batch is one gRPC message. Requests that set `kv_cache_report_mode=full`
 can produce batches above the 4 MiB that gRPC clients accept by default, so
 subscribers should raise their receive limit.
+
+`KvEvents.GetKvSnapshot` returns the blocks one rank's GPU cache holds, as the
+stores that recreate them, parents first, followed by the cursor to subscribe
+from. A client that starts after the engine, or whose stream ended with
+`OUT_OF_RANGE` or `DATA_LOSS`, loads a snapshot and resumes from that cursor.
+The frontend builds snapshots from the events themselves, which it follows from
+the engine's first batch, so the engine does no work for one. A snapshot leaves
+out the blocks of other tiers, any block whose parent is no longer held, and
+the blocks of a store whose tokens do not divide evenly among its blocks (cache
+groups with null or masked blocks). A client that loaded one can therefore drop
+such a block while the cache still holds a copy. If the frontend itself loses
+batches, its snapshots say `complete: false` until the engine clears its cache.
+
+Snapshots are on whenever KV cache events are. They cost frontend memory for
+every block the cache holds: about 160 bytes plus 3 bytes per token, and more
+for a block with extra keys of its own, such as a multimodal one. To turn them
+off, set `"grpc_snapshot": false` in `--kv-events-config`; the call then fails
+with `FAILED_PRECONDITION`, and the event stream is unaffected.

@@ -2722,6 +2722,7 @@ fn kv_event_sources_expose_the_zmq_publisher_and_this_frontends_stream() {
         hwm: 100_000,
         max_queue_size: 100_000,
         topic: "kv".to_string(),
+        grpc_snapshot: true,
         frontend_endpoint: None,
         frontend_replay_endpoint: None,
     });
@@ -3846,6 +3847,7 @@ fn kv_event_batch_with_every_field() -> (KvEventBatch, pb::KvEventBatch) {
             ownership: Some("kvcr".to_string()),
             session_id: Some("session-1".to_string()),
             lookahead_token_ids: Some(vec![vec![12], vec![13]]),
+            reuse_report: true,
         }),
         KvCacheEvent::BlockRemoved(BlockRemoved {
             block_hashes: vec![ExternalBlockHash::Unsigned(1)],
@@ -3897,6 +3899,7 @@ fn kv_event_batch_with_every_field() -> (KvEventBatch, pb::KvEventBatch) {
             locality: Some("LOCAL".to_string()),
             ownership: Some("kvcr".to_string()),
             lookahead_token_ids: vec![tokens(&[12]), tokens(&[13])],
+            reuse_report: true,
         }),
         Event::BlockRemoved(pb::BlockRemoved {
             block_hashes: vec![hash(Hash::UnsignedValue(1))],
@@ -4029,4 +4032,172 @@ async fn kv_events_require_an_engine_that_publishes_them() {
     let (service, _engine_task) = kv_events_service(None).await;
     let status = subscribe_kv_events(&service, None).await.err().unwrap();
     assert_eq!(status.code(), Code::FailedPrecondition);
+}
+
+/// A store of one-token blocks in the device cache, as the engine publishes it.
+fn kv_blocks_stored(hashes: &[u64], parent: Option<u64>, token_ids: &[u32]) -> BlockStored {
+    BlockStored {
+        block_hashes: hashes.iter().copied().map(ExternalBlockHash::Unsigned).collect(),
+        parent_block_hash: parent.map(ExternalBlockHash::Unsigned),
+        token_ids: token_ids.to_vec(),
+        block_size: 1,
+        medium: Some("GPU".to_string()),
+        ..Default::default()
+    }
+}
+
+/// A store of one-token blocks after no other, as a snapshot carries it.
+fn kv_snapshot_store(hashes: &[u64], token_ids: &[u64]) -> pb::BlockStored {
+    let hash = |&hash| pb::BlockHash {
+        value: Some(pb::block_hash::Value::UnsignedValue(hash)),
+    };
+    let token_ids = pb::TokenIdList {
+        token_ids: token_ids.to_vec(),
+    };
+    pb::BlockStored {
+        block_hashes: hashes.iter().map(hash).collect(),
+        token_ids: Some(pb::BlockTokenIds {
+            ids: Some(pb::block_token_ids::Ids::Single(token_ids)),
+        }),
+        block_size: 1,
+        medium: Some("GPU".to_string()),
+        ..Default::default()
+    }
+}
+
+/// The snapshot of rank 0 once the service has applied every batch before
+/// `next`: its stores and its end.
+async fn kv_snapshot(
+    service: &KvEventsServiceImpl,
+    next: u64,
+) -> (Vec<pb::BlockStored>, pb::KvSnapshotEnd) {
+    use pb::get_kv_snapshot_response::Item;
+    use pb::kv_events_server::KvEvents as _;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no snapshot at batch {next}"
+        );
+        let request = pb::GetKvSnapshotRequest {
+            data_parallel_rank: 0,
+        };
+        // Unavailable until the service has connected to the publisher.
+        if let Ok(response) = service.get_kv_snapshot(Request::new(request)).await {
+            let mut responses = response.into_inner();
+            let mut stores = Vec::new();
+            let end = loop {
+                match responses.next().await.expect("a snapshot ends with `end`").unwrap().item {
+                    Some(Item::Blocks(blocks)) => stores.extend(blocks.stored),
+                    Some(Item::End(end)) => break end,
+                    None => panic!("an empty snapshot response"),
+                }
+            };
+            assert!(responses.next().await.is_none());
+            if end.resume.as_ref().expect("a cursor").next_sequence_number == next {
+                return (stores, end);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kv_snapshot_holds_the_device_cache_and_joins_the_stream() {
+    let ipc = IpcNamespace::new().expect("create ipc namespace");
+    let mut publisher = MockKvEventPublisher::bind(&ipc).await;
+    // Published before the service started.
+    let stores = [
+        kv_blocks_stored(&[1, 2, 3], None, &[11, 12, 13]),
+        kv_blocks_stored(&[4], Some(2), &[14]),
+        kv_blocks_stored(&[5], Some(3), &[15]),
+        // A second copy of block 1.
+        kv_blocks_stored(&[1], None, &[11]),
+    ];
+    publisher.retain(
+        0,
+        &kv_event_batch(stores.map(KvCacheEvent::BlockStored).into()),
+    );
+    // Block 5 loses its parent.
+    let removed = BlockRemoved {
+        block_hashes: vec![ExternalBlockHash::Unsigned(3)],
+        medium: Some("GPU".to_string()),
+        ..Default::default()
+    };
+    publisher.retain(
+        1,
+        &kv_event_batch(vec![KvCacheEvent::BlockRemoved(removed)]),
+    );
+    let (service, _engine_task) = kv_events_service(Some(publisher.config.clone())).await;
+
+    let (stores, end) = kv_snapshot(&service, 2).await;
+    assert_eq!(
+        stores,
+        [
+            kv_snapshot_store(&[1, 2, 4], &[11, 12, 14]),
+            kv_snapshot_store(&[1], &[11])
+        ]
+    );
+    assert!(end.complete);
+
+    // The stream continues from the snapshot with the next batch.
+    let resume = end.resume.expect("a cursor");
+    let resume = Some((resume.stream_id.as_str(), resume.next_sequence_number));
+    let (_, mut resumed) = subscribe_kv_events(&service, resume).await.unwrap();
+    let next = publish_kv_events_until_received(&mut publisher, 2, &mut resumed).await;
+    assert_eq!(next.sequence_number, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kv_snapshot_is_incomplete_after_lost_batches_until_the_cache_is_cleared() {
+    let ipc = IpcNamespace::new().expect("create ipc namespace");
+    let mut publisher = MockKvEventPublisher::bind(&ipc).await;
+    let stored = KvCacheEvent::BlockStored(kv_blocks_stored(&[1], None, &[11]));
+    publisher.retain(0, &kv_event_batch(vec![stored]));
+    let (service, _engine_task) = kv_events_service(Some(publisher.config.clone())).await;
+    assert!(kv_snapshot(&service, 1).await.1.complete);
+
+    // Batch 1 is neither delivered nor buffered.
+    let (_, mut live) = subscribe_kv_events(&service, None).await.unwrap();
+    publish_kv_events_until_received(&mut publisher, 2, &mut live).await;
+    let (stores, end) = kv_snapshot(&service, 3).await;
+    assert_eq!(
+        (stores, end.complete),
+        (vec![kv_snapshot_store(&[1], &[11])], false)
+    );
+
+    let stored = KvCacheEvent::BlockStored(kv_blocks_stored(&[8], None, &[18]));
+    publisher
+        .publish(
+            3,
+            &kv_event_batch(vec![KvCacheEvent::AllBlocksCleared, stored]),
+        )
+        .await;
+    let (stores, end) = kv_snapshot(&service, 4).await;
+    assert_eq!(
+        (stores, end.complete),
+        (vec![kv_snapshot_store(&[8], &[18])], true)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kv_snapshot_can_be_turned_off_and_the_stream_kept() {
+    use pb::kv_events_server::KvEvents as _;
+
+    let ipc = IpcNamespace::new().expect("create ipc namespace");
+    let mut publisher = MockKvEventPublisher::bind(&ipc).await;
+    let config = KvEventsConfig {
+        grpc_snapshot: false,
+        ..publisher.config.clone()
+    };
+    let (service, _engine_task) = kv_events_service(Some(config)).await;
+
+    let request = pb::GetKvSnapshotRequest {
+        data_parallel_rank: 0,
+    };
+    let status = service.get_kv_snapshot(Request::new(request)).await.err().unwrap();
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    let (_, mut live) = subscribe_kv_events(&service, None).await.unwrap();
+    publish_kv_events_until_received(&mut publisher, 0, &mut live).await;
 }

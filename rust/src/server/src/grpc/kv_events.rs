@@ -1,37 +1,65 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+mod ledger;
 mod relay;
+mod snapshot;
 
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use asynk_strim_attr::{TryYielder, try_stream};
 use futures::Stream;
+use parking_lot::Mutex;
 use thiserror_ext::AsReport as _;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, mpsc};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 use tonic::{Request, Response, Status};
+use tracing::warn;
 use vllm_engine_core_client::protocol::handshake::KvEventsConfig;
 use vllm_engine_core_client::protocol::kv_events::{
     BlockRemoved, BlockStored, ExternalBlockHash, ExtraKeyValue, KvCacheEvent, KvEventBatch,
 };
 
-use self::relay::{KvEventReader, KvEventRelay, ReadError};
+use self::relay::{KvEventReader, KvEventRelay, RETRY_DELAY, ReadError};
+use self::snapshot::Blocks;
 use super::{KvEventsServer, pb};
 use crate::state::AppState;
 
 pub(crate) type KvEventsGrpcService = KvEventsServer<KvEventsServiceImpl>;
 
+/// Snapshot responses built ahead of the client reading them. Arbitrary.
+const SNAPSHOT_RESPONSES_AHEAD: usize = 2;
+/// How long a client may take to read a snapshot response before the snapshot
+/// is dropped. Arbitrary.
+const SNAPSHOT_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// gRPC KV event service: re-publishes each engine's ZMQ KV events as typed
-/// streams.
+/// streams, and serves snapshots of the blocks they add up to.
 pub struct KvEventsServiceImpl {
-    /// By data-parallel rank: the private addresses its engine publishes on
-    /// for this frontend, and its relay, started by its first subscriber.
-    ranks: BTreeMap<u32, (Option<PublisherAddresses>, OnceCell<KvEventRelay>)>,
+    /// By data-parallel rank; `None` for an engine that publishes no KV events
+    /// to this frontend.
+    ranks: BTreeMap<u32, Option<Arc<Publisher>>>,
     /// Ends the streams, which would otherwise hold up a graceful shutdown.
     shutdown: CancellationToken,
+    _block_followers: Vec<AbortOnDropHandle<()>>,
+}
+
+/// One engine's KV event publisher, as this frontend serves it.
+struct Publisher {
+    addresses: PublisherAddresses,
+    /// Started with the service when `blocks` are kept, otherwise by the first
+    /// subscriber.
+    relay: OnceCell<KvEventRelay>,
+    /// The blocks the engine's device cache holds, kept unless the engine's
+    /// `grpc_snapshot` is off.
+    blocks: Option<Arc<Mutex<Blocks>>>,
+    /// Held while a snapshot is sent: each holds a copy of `blocks`.
+    one_snapshot: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Where an engine publishes its KV events for this frontend.
@@ -57,13 +85,98 @@ impl PublisherAddresses {
 
 impl KvEventsServiceImpl {
     pub fn new(state: Arc<AppState>, shutdown: CancellationToken) -> Self {
-        let ranks = (state.engine_core_client().ready_responses().into_iter())
+        let ranks: BTreeMap<_, _> = (state.engine_core_client().ready_responses().into_iter())
             .map(|ready| {
-                let publisher = PublisherAddresses::of(ready.kv_events_config.as_ref());
-                (ready.data_parallel_rank, (publisher, OnceCell::new()))
+                let config = ready.kv_events_config.as_ref();
+                let publisher = PublisherAddresses::of(config).map(|addresses| {
+                    let snapshots = config.is_some_and(|config| config.grpc_snapshot);
+                    Arc::new(Publisher {
+                        addresses,
+                        relay: OnceCell::new(),
+                        blocks: snapshots.then(Arc::default),
+                        one_snapshot: Arc::default(),
+                    })
+                });
+                (ready.data_parallel_rank, publisher)
             })
             .collect();
-        Self { ranks, shutdown }
+        let block_followers = (ranks.values().flatten())
+            .filter_map(|publisher| {
+                let follow = follow_blocks(publisher.clone(), publisher.blocks.clone()?);
+                Some(AbortOnDropHandle::new(tokio::spawn(follow)))
+            })
+            .collect();
+        Self {
+            ranks,
+            shutdown,
+            _block_followers: block_followers,
+        }
+    }
+
+    fn publisher(&self, rank: u32) -> Result<&Publisher, Status> {
+        let publisher = self.ranks.get(&rank).ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "data parallel rank {rank} is not connected to this frontend; \
+                 connected ranks: {:?}",
+                self.ranks.keys().collect::<Vec<_>>()
+            ))
+        })?;
+        publisher.as_deref().ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "the engine of rank {rank} does not publish KV cache events; \
+                 enable them with --kv-events-config"
+            ))
+        })
+    }
+}
+
+/// Keeps `blocks` in step with the engine's batches, from the first.
+async fn follow_blocks(publisher: Arc<Publisher>, blocks: Arc<Mutex<Blocks>>) {
+    let connect = || KvEventRelay::connect(&publisher.addresses);
+    let relay = loop {
+        match publisher.relay.get_or_try_init(connect).await {
+            Ok(relay) => break relay,
+            Err(error) => {
+                warn!(error = %error.as_report(), "failed to connect to the KV event publisher");
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+        }
+    };
+
+    // The batch to read on from; `None` once the batches before the live ones are lost.
+    let mut next = Some(0);
+    loop {
+        let read: Result<Infallible, ReadError> = async {
+            let cursor = next.map(|next_sequence_number| pb::KvEventCursor {
+                stream_id: String::new(),
+                next_sequence_number,
+            });
+            let mut reader = relay.reader(cursor).await?;
+            if next.is_none() {
+                warn!("lost KV event batches; snapshots are incomplete until the cache is cleared");
+                blocks.lock().lost(reader.next_sequence_number().unwrap_or(0));
+            }
+            loop {
+                let batch = reader.next_batch().await?;
+                next = Some(batch.sequence_number + 1);
+                // The fold walks every block of the batch: keep it off the
+                // threads that serve requests. One that does not finish leaves
+                // the blocks unknown.
+                let blocks = blocks.clone();
+                let fold = tokio::task::spawn_blocking(move || blocks.lock().apply(&batch));
+                fold.await.map_err(|_| ReadError::DataLoss)?;
+            }
+        }
+        .await;
+        let Err(error) = read;
+        match error {
+            ReadError::OutOfRange | ReadError::DataLoss => next = None,
+            ReadError::ReplayFailed(error) => {
+                warn!(error, "the engine's KV event replay failed; retrying");
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            ReadError::RelayStopped => return,
+        }
     }
 }
 
@@ -71,6 +184,8 @@ impl KvEventsServiceImpl {
 impl pb::kv_events_server::KvEvents for KvEventsServiceImpl {
     type SubscribeKvEventsStream =
         Pin<Box<dyn Stream<Item = Result<pb::SubscribeKvEventsResponse, Status>> + Send>>;
+    type GetKvSnapshotStream =
+        Pin<Box<dyn Stream<Item = Result<pb::GetKvSnapshotResponse, Status>> + Send>>;
 
     async fn subscribe_kv_events(
         &self,
@@ -78,35 +193,63 @@ impl pb::kv_events_server::KvEvents for KvEventsServiceImpl {
     ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
         let request = request.into_inner();
         let rank = request.data_parallel_rank;
-        let (publisher, relay) = self.ranks.get(&rank).ok_or_else(|| {
-            Status::invalid_argument(format!(
-                "data parallel rank {rank} is not connected to this frontend; \
-                 connected ranks: {:?}",
-                self.ranks.keys().collect::<Vec<_>>()
-            ))
-        })?;
-        let publisher = publisher.as_ref().ok_or_else(|| {
-            Status::failed_precondition(format!(
-                "the engine of rank {rank} does not publish KV cache events; \
-                 enable them with --kv-events-config"
-            ))
-        })?;
+        let publisher = self.publisher(rank)?;
         // A failed connect is retried by the next subscriber.
-        let relay =
-            relay
-                .get_or_try_init(|| KvEventRelay::connect(publisher))
-                .await
-                .map_err(|error| {
-                    Status::unavailable(format!(
-                        "failed to connect to the KV event publisher of rank {rank}: {}",
-                        error.as_report()
-                    ))
-                })?;
+        let relay = (publisher.relay)
+            .get_or_try_init(|| KvEventRelay::connect(&publisher.addresses))
+            .await
+            .map_err(|error| {
+                Status::unavailable(format!(
+                    "failed to connect to the KV event publisher of rank {rank}: {}",
+                    error.as_report()
+                ))
+            })?;
 
         let reader = relay.reader(request.resume).await.map_err(read_status)?;
         Ok(Response::new(Box::pin(kv_event_responses(
             reader,
             rank,
+            self.shutdown.clone(),
+        ))))
+    }
+
+    async fn get_kv_snapshot(
+        &self,
+        request: Request<pb::GetKvSnapshotRequest>,
+    ) -> Result<Response<Self::GetKvSnapshotStream>, Status> {
+        let rank = request.into_inner().data_parallel_rank;
+        let publisher = self.publisher(rank)?;
+        let blocks = publisher.blocks.clone().ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "KV cache snapshots of rank {rank} are turned off: `grpc_snapshot` is false in \
+                 --kv-events-config"
+            ))
+        })?;
+        let relay = publisher.relay.get().ok_or_else(|| {
+            Status::unavailable(format!(
+                "not connected to the KV event publisher of rank {rank} yet"
+            ))
+        })?;
+        let stream_id = relay.stream_id().to_string();
+
+        let one_snapshot = publisher.one_snapshot.clone().lock_owned().await;
+        let (responses, received) = mpsc::channel(SNAPSHOT_RESPONSES_AHEAD);
+        let runtime = tokio::runtime::Handle::current();
+        // The snapshot copies the rank's ledgers and walks every block.
+        tokio::task::spawn_blocking(move || {
+            let _one_snapshot = one_snapshot;
+            let snapshot = blocks.lock().snapshot(stream_id);
+            for response in snapshot {
+                // A client that went away or stopped reading must not hold up
+                // the rank's next snapshot.
+                let sent = responses.send_timeout(response, SNAPSHOT_READ_TIMEOUT);
+                if runtime.block_on(sent).is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(kv_snapshot_responses(
+            received,
             self.shutdown.clone(),
         ))))
     }
@@ -158,6 +301,26 @@ async fn kv_event_responses(
             item: Some(Item::Batch(Arc::unwrap_or_clone(batch))),
         })
         .await;
+    }
+}
+
+#[try_stream]
+async fn kv_snapshot_responses(
+    mut responses: mpsc::Receiver<pb::GetKvSnapshotResponse>,
+    shutdown: CancellationToken,
+    mut y: TryYielder<pb::GetKvSnapshotResponse, Status>,
+) -> Result<(), Status> {
+    loop {
+        let response = tokio::select! {
+            _ = shutdown.cancelled() => {
+                return Err(Status::unavailable("the server is shutting down"));
+            }
+            response = responses.recv() => response,
+        };
+        let Some(response) = response else {
+            return Ok(());
+        };
+        y.yield_ok(response).await;
     }
 }
 
@@ -218,6 +381,7 @@ fn stored_to_proto(stored: BlockStored) -> pb::BlockStored {
         lookahead_token_ids: (stored.lookahead_token_ids.unwrap_or_default().into_iter())
             .map(token_id_list)
             .collect(),
+        reuse_report: stored.reuse_report,
     }
 }
 

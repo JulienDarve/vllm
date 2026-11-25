@@ -63,7 +63,8 @@ The separate `vllm serve MODEL --grpc --port 50051` command launches the Python
 SMG `VllmEngine` gRPC server in place of HTTP. The Rust listener exposes the
 `vllm.Inference`, `vllm.Control`, `vllm.KvEvents`, and `vllm.Render` services alongside HTTP.
 `vllm.KvEvents` streams the KV cache events of engines started with
-`--kv-events-config`; see [the protocol notes](proto/README.md#kv-cache-events). These are different
+`--kv-events-config`, and serves snapshots of the blocks their GPU caches
+hold; see [the protocol notes](proto/README.md#kv-cache-events). These are different
 gRPC APIs; `--grpc` and `--grpc-port` are mutually exclusive.
 
 ### gRPC health checks

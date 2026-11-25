@@ -30,6 +30,50 @@ service KvEvents {
   // UNAVAILABLE: the engine's publisher or replay socket did not answer, or
   //   the server is shutting down.
   rpc SubscribeKvEvents (SubscribeKvEventsRequest) returns (stream SubscribeKvEventsResponse) {}
+
+  // Streams the blocks that one data-parallel rank's device cache (medium
+  // `GPU`) holds, as the stores that recreate them: applied in order to an
+  // empty state, they give the state after every batch before `end.resume`.
+  // A block follows its parent, and a block held more than once is stored
+  // once per copy. Left out: a block whose parent is not held, with its
+  // copies, and the blocks of a store whose tokens do not divide evenly among
+  // its blocks. A client that loaded the snapshot can therefore drop such a
+  // block while the cache still holds a copy. The last response is `end`; a
+  // stream that ends without it is not a snapshot. To follow the cache from
+  // the snapshot, subscribe with `end.resume`.
+  //
+  // INVALID_ARGUMENT: the rank is not connected to this server.
+  // FAILED_PRECONDITION: the engine does not publish KV cache events, or
+  //   `grpc_snapshot` is false in its KV events config.
+  // UNAVAILABLE: the server has not connected to the engine's publisher yet,
+  //   or is shutting down.
+  rpc GetKvSnapshot (GetKvSnapshotRequest) returns (stream GetKvSnapshotResponse) {}
+}
+
+message GetKvSnapshotRequest {
+  uint32 data_parallel_rank = 1;
+}
+
+message GetKvSnapshotResponse {
+  oneof item {
+    KvSnapshotBlocks blocks = 1;
+    // Always last.
+    KvSnapshotEnd end = 2;
+  }
+}
+
+message KvSnapshotBlocks {
+  // `session_id` is never set: it describes a store event, not a block.
+  repeated BlockStored stored = 1;
+}
+
+message KvSnapshotEnd {
+  // The first batch the snapshot does not include.
+  KvEventCursor resume = 1;
+  // False when the server missed batches, so the snapshot may lack blocks the
+  // cache holds or hold blocks the cache dropped. True again once the engine
+  // clears its cache.
+  bool complete = 2;
 }
 
 message SubscribeKvEventsRequest {
@@ -131,6 +175,9 @@ message BlockStored {
   optional string ownership = 16;
   // One entry per block.
   repeated TokenIdList lookahead_token_ids = 17;
+  // The event reports blocks that a request reused (`kv_cache_report_mode`
+  // "full"): they were already stored, and no copy was added.
+  bool reuse_report = 18;
 }
 
 message BlockRemoved {

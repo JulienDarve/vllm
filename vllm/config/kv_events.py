@@ -49,6 +49,12 @@ class KVEventsConfig:
     this topic to receive events.
     """
 
+    grpc_snapshot: bool = True
+    """Whether the Rust frontend keeps the blocks the GPU cache holds, so that
+    its gRPC `KvEvents.GetKvSnapshot` can return them. It costs frontend memory
+    for every block held. Only the Rust frontend with a gRPC port uses it.
+    """
+
     _frontend_endpoint: str | None = None
     """Private address the Rust frontend reads events from, bound in addition
     to `endpoint`. Set from the engine's startup handshake, not by users."""

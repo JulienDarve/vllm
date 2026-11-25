@@ -464,6 +464,7 @@ def test_frontend_endpoints_carry_the_same_stream(random_port, tmp_path):
         publisher="zmq",
         endpoint=f"tcp://*:{random_port}",
         topic="kv",
+        grpc_snapshot=False,
     )
     config._frontend_endpoint = frontend_endpoint
     config._frontend_replay_endpoint = frontend_replay_endpoint
@@ -472,6 +473,7 @@ def test_frontend_endpoints_carry_the_same_stream(random_port, tmp_path):
     assert resolved._frontend_endpoint == frontend_endpoint
     assert resolved._frontend_replay_endpoint == frontend_replay_endpoint
     assert resolved.replay_endpoint is None
+    assert not resolved.grpc_snapshot
 
     user = MockSubscriber(f"tcp://127.0.0.1:{random_port}", topic="kv")
     frontend = MockSubscriber(frontend_endpoint, frontend_replay_endpoint, topic="kv")

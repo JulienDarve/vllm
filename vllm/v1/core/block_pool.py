@@ -354,12 +354,14 @@ class BlockPool:
         kv_cache_group_id: int,
         extra_keys_list: list[tuple[Any, ...] | None],
         lookahead_token_ids: list[list[int]] | None,
+        reuse_report: bool = False,
     ) -> BlockStored:
         """Build a `BlockStored` KV event for `request`.
 
         Shared by `cache_full_blocks` (newly cached blocks) and
         `emit_cached_block_events` (prefix-cache-reused blocks) so both emit
-        identical event shapes for downstream consumers.
+        identical event shapes for downstream consumers, apart from
+        `reuse_report`.
         """
         return BlockStored(
             block_hashes=block_hashes,
@@ -373,6 +375,7 @@ class BlockPool:
             group_idx=kv_cache_group_id,
             session_id=request.session_id,
             lookahead_token_ids=lookahead_token_ids,
+            reuse_report=reuse_report,
         )
 
     def emit_cached_block_events(
@@ -453,6 +456,7 @@ class BlockPool:
                 kv_cache_group_id=kv_cache_group_id,
                 extra_keys_list=extra_keys_list,
                 lookahead_token_ids=lookahead_token_ids,
+                reuse_report=True,
             )
         )
 

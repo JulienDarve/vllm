@@ -20,7 +20,7 @@ const LIVE_CAPACITY: usize = 1024;
 
 /// Pause after a failed read from the publisher, which fails repeatedly while
 /// the connection is down.
-const RETRY_DELAY: Duration = Duration::from_secs(1);
+pub(super) const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Why a reader cannot start or continue.
 #[derive(Debug)]
@@ -61,6 +61,10 @@ impl KvEventRelay {
             replay_endpoint: publisher.replay_endpoint.clone(),
             _task: AbortOnDropHandle::new(task),
         })
+    }
+
+    pub fn stream_id(&self) -> &str {
+        &self.stream_id
     }
 
     /// A reader of live batches, first replaying the engine's buffered batches
@@ -131,6 +135,10 @@ pub(super) struct KvEventReader {
 impl KvEventReader {
     pub fn stream_id(&self) -> &str {
         &self.stream_id
+    }
+
+    pub fn next_sequence_number(&self) -> Option<u64> {
+        self.next
     }
 
     /// The next batch, each sequence number once and in order.

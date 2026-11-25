@@ -98,6 +98,10 @@ class BlockStored(KVCacheEvent):
     None when lookahead hashing is disabled.
     """
     lookahead_token_ids: list[list[int]] | None = None
+    """True when the event reports blocks a request reused from the prefix
+    cache: they were already stored, and no copy was added.
+    """
+    reuse_report: bool = False
 
     def __hash__(self) -> int:
         return hash(
@@ -118,6 +122,7 @@ class BlockStored(KVCacheEvent):
                 tuple(map(tuple, self.lookahead_token_ids))
                 if self.lookahead_token_ids is not None
                 else None,
+                self.reuse_report,
             )
         )
 
@@ -348,6 +353,7 @@ class ZmqEventPublisher(EventPublisher):
         topic: str = "",
         frontend_endpoint: str | None = None,
         frontend_replay_endpoint: str | None = None,
+        grpc_snapshot: bool = True,
     ) -> None:
         # Storage
         super().__init__(data_parallel_rank)
@@ -381,6 +387,7 @@ class ZmqEventPublisher(EventPublisher):
             hwm=hwm,
             max_queue_size=max_queue_size,
             topic=topic,
+            grpc_snapshot=grpc_snapshot,
             _frontend_endpoint=self._frontend_endpoint,
             _frontend_replay_endpoint=self._frontend_replay_endpoint,
         )
@@ -623,12 +630,13 @@ class EventPublisherFactory:
 
         kind = config_dict.pop("publisher")
         config_dict.pop("enable_kv_cache_events")
-        frontend_endpoints = {
+        frontend_options = {
             "frontend_endpoint": config_dict.pop("_frontend_endpoint"),
             "frontend_replay_endpoint": config_dict.pop("_frontend_replay_endpoint"),
+            "grpc_snapshot": config_dict.pop("grpc_snapshot"),
         }
         if kind == "zmq":
-            config_dict.update(frontend_endpoints)
+            config_dict.update(frontend_options)
         try:
             constructor = cls._registry[kind]
         except KeyError as exc:

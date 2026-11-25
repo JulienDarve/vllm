@@ -465,7 +465,7 @@ An attacker who can reach the gRPC port can:
 2. **Mutate engine state** by pausing generation, sleeping the engine, or initiating configured RL weight updates through the `Control` service
 3. **Consume GPU and compute resources** by submitting unbounded generation requests
 4. **Stop a managed engine** through `Control.Shutdown`, or cause denial of service by exploiting bugs in the gRPC interface.
-5. **Read other users' prompt and output tokens** through `KvEvents.SubscribeKvEvents` when KV cache events are enabled, because the events carry the token IDs of every cached block
+5. **Read other users' prompt and output tokens** through `KvEvents.SubscribeKvEvents` and `KvEvents.GetKvSnapshot` when KV cache events are enabled, because the events and snapshots carry the token IDs of every cached block
 
 ### Recommendations
 
