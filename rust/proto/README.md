@@ -66,34 +66,33 @@ publishing credentials.
 with `--kv-events-config '{"enable_kv_cache_events": true}'`, one stream per
 data-parallel rank, with the same batches and sequence numbers as the engine's
 ZMQ publisher. Nothing else needs configuring: at startup the frontend gives
-each engine a private events address and replay address, which the publisher
-binds in addition to its configured endpoints: IPC when every engine it connects
-to runs on its node, and TCP on each engine's own node otherwise (under
+each engine a private events address, which the publisher binds in addition to
+its configured endpoint: IPC when every engine it connects to runs on its node,
+and TCP on each engine's own node otherwise (under
 `VLLM_USE_RUST_FRONTEND=1 vllm serve`, only for the engines on other nodes).
 `Control.GetKvEventSources` lists the stream as a source with transport `grpc`.
 
-A subscriber without `resume` receives live batches. With `resume`, the
-frontend first replays the batches the engine still buffers (`buffer_steps`)
-from the cursor, then continues live; it keeps no history of its own, and fills
-batches its own subscription misses from the same buffer. A cursor older than
-the buffer fails with `OUT_OF_RANGE`; batches that can no longer be recovered
-end the stream with `DATA_LOSS`.
+The stream carries live batches only, from the next one the engine publishes;
+the frontend keeps no history and does not replay. As with a ZMQ subscriber, a
+gap in the sequence numbers means batches were lost.
 
 Each batch is one gRPC message. Requests that set `kv_cache_report_mode=full`
 can produce batches above the 4 MiB that gRPC clients accept by default, so
 subscribers should raise their receive limit.
 
 `KvEvents.GetKvSnapshot` returns the blocks one rank's GPU cache holds, as the
-stores that recreate them, parents first, followed by the cursor to subscribe
-from. A client that starts after the engine, or whose stream ended with
-`OUT_OF_RANGE` or `DATA_LOSS`, loads a snapshot and resumes from that cursor.
-The frontend builds snapshots from the events themselves, which it follows from
-the engine's first batch, so the engine does no work for one. A snapshot leaves
-out the blocks of other tiers, any block whose parent is no longer held, and
-the blocks of a store whose tokens do not divide evenly among its blocks (cache
-groups with null or masked blocks). A client that loaded one can therefore drop
-such a block while the cache still holds a copy. If the frontend itself loses
-batches, its snapshots say `complete: false` until the engine clears its cache.
+stores that recreate them, parents first, followed by the number of the first
+batch it does not include. A client that starts after the engine, or that sees
+a gap in the sequence numbers, subscribes, then loads a snapshot, then applies
+the batches from that number on: the snapshot holds every batch a subscriber
+was sent before the call. The frontend builds snapshots from the events
+themselves, which it follows from the engine's first batch, so the engine does
+no work for one. A snapshot leaves out the blocks of other tiers, any block
+whose parent is no longer held, and the blocks of a store whose tokens do not
+divide evenly among its blocks (cache groups with null or masked blocks). A
+client that loaded one can therefore drop such a block while the cache still
+holds a copy. If the frontend itself misses batches, its snapshots say
+`complete: false` until the engine clears its cache.
 
 Snapshots are on whenever KV cache events are. They cost frontend memory for
 every block the cache holds: about 160 bytes plus 3 bytes per token, and more

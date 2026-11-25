@@ -3836,7 +3836,6 @@ async fn kv_event_sources_reports_each_ready_engine() {
                 topic: "kv".to_string(),
                 grpc_snapshot: true,
                 frontend_endpoint: None,
-                frontend_replay_endpoint: None,
             },
         ),
         ..default_ready_response()
@@ -3869,7 +3868,6 @@ async fn kv_event_sources_reports_each_ready_engine() {
                 "topic": "kv",
                 "grpc_snapshot": true,
                 "_frontend_endpoint": null,
-                "_frontend_replay_endpoint": null,
             }
         })
     );
