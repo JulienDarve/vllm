@@ -727,9 +727,10 @@ pub struct SharedRuntimeArgs {
     #[serde(skip)]
     pub keep_alive_on_engine_death: bool,
 
-    /// Maximum HTTP request body size in bytes (default 32 MiB); `0` removes
-    /// the limit, like the Python frontend, which has none. It is set only
-    /// through `VLLM_HTTP_MAX_REQUEST_BODY_SIZE`.
+    /// Maximum size in bytes of an HTTP request body and of a gRPC request
+    /// message (default 32 MiB); `0` removes the limit, like the Python
+    /// frontend, which has none. It is set only through
+    /// `VLLM_HTTP_MAX_REQUEST_BODY_SIZE`.
     #[arg(
         long,
         hide = true,
@@ -1512,8 +1513,8 @@ pub struct ServeArgs {
     /// Unix domain socket path. If set, host and port arguments are ignored.
     #[arg(long)]
     pub uds: Option<String>,
-    /// TCP port for the gRPC Inference, Control, and Render services. When not
-    /// set, no gRPC server is started.
+    /// TCP port for the gRPC Inference, Control, KvEvents, and Render services.
+    /// When not set, no gRPC server is started.
     #[arg(long)]
     pub grpc_port: Option<u16>,
 

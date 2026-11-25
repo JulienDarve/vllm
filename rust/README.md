@@ -43,8 +43,8 @@ For example:
 VLLM_USE_RUST_FRONTEND=1 vllm serve Qwen/Qwen3-0.6B
 ```
 
-To also expose the Rust frontend's gRPC inference, control, and render services,
-add `--grpc-port`. The HTTP listener remains on `--port`:
+To also expose the Rust frontend's gRPC inference, control, KV event, and render
+services, add `--grpc-port`. The HTTP listener remains on `--port`:
 
 ```bash
 VLLM_USE_RUST_FRONTEND=1 vllm serve Qwen/Qwen3-0.6B \
@@ -61,7 +61,9 @@ frontend process and cannot be combined with `--headless` or
 
 The separate `vllm serve MODEL --grpc --port 50051` command launches the Python
 SMG `VllmEngine` gRPC server in place of HTTP. The Rust listener exposes the
-`vllm.Inference`, `vllm.Control`, and `vllm.Render` services alongside HTTP. These are different
+`vllm.Inference`, `vllm.Control`, `vllm.KvEvents`, and `vllm.Render` services alongside HTTP.
+`vllm.KvEvents` streams the KV cache events of engines started with
+`--kv-events-config`; see [the protocol notes](proto/README.md#kv-cache-events). These are different
 gRPC APIs; `--grpc` and `--grpc-port` are mutually exclusive.
 
 ### gRPC health checks
@@ -154,12 +156,17 @@ vLLM it does not look at the weights or the GPU, so pass the engine's dtype
 when they decide it. Set `--max-model-len` to the engine's too: some image
 processors size images to fit the context. Large images make `features` big;
 the generate server may need `VLLM_HTTP_MAX_REQUEST_BODY_SIZE` raised above
-its 32 MiB default to accept them. Set
+its 32 MiB default to accept them; the same limit applies to gRPC request
+messages. Set
 `"mm_payload": "none"` on a render request to get only item hashes and
 placeholder ranges, for example for cache-aware routing; such a response cannot
 be sent to generate. Pass `--language-model-only` to skip multimodal
 processing, and set `--limit-mm-per-prompt` to the engine's limits so that
-render rejects the same requests.
+render enforces the same item counts. The Rust frontend defaults to 999 items
+per modality. Set an explicit video count of 32 to match the Python default
+for Qwen3-VL and its derived processors when serving those models. The
+`VLLM_MAX_MEDIA_PREPROCESSING_BYTES` setting applies to supported Python
+processors.
 
 Pass `--lora-modules name=path ...` to accept LoRA adapter names as the request
 `model`; rendering does not load the adapter weights, and the adapter name is
