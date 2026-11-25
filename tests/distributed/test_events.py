@@ -463,10 +463,13 @@ def test_frontend_endpoint_carries_the_same_stream(random_port, tmp_path):
         publisher="zmq",
         endpoint=f"tcp://*:{random_port}",
         topic="kv",
+        grpc_snapshot=False,
     )
     config._frontend_endpoint = frontend_endpoint
     publisher = EventPublisherFactory.create(config, DP_RANK)
-    assert publisher.get_publisher_config()._frontend_endpoint == frontend_endpoint
+    resolved = publisher.get_publisher_config()
+    assert resolved._frontend_endpoint == frontend_endpoint
+    assert not resolved.grpc_snapshot
 
     user = MockSubscriber(f"tcp://127.0.0.1:{random_port}", topic="kv")
     frontend = MockSubscriber(frontend_endpoint, topic="kv")

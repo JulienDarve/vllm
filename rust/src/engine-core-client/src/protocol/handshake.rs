@@ -35,6 +35,9 @@ pub struct KvEventsConfig {
     pub hwm: u32,
     pub max_queue_size: u32,
     pub topic: String,
+    /// Whether the frontend keeps the blocks the device cache holds, to serve
+    /// snapshots of them.
+    pub grpc_snapshot: bool,
     /// The private events address this frontend asked the engine to bind, as
     /// bound.
     #[serde(default, rename = "_frontend_endpoint")]

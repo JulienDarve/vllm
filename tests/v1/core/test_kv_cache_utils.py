@@ -1246,6 +1246,7 @@ def test_kv_event_fields_are_the_ones_the_rust_frontend_forwards():
             "ownership",
             "session_id",
             "lookahead_token_ids",
+            "reuse_report",
         ],
         "BlockRemoved": [
             "block_hashes",

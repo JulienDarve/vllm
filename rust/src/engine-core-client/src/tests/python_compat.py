@@ -510,6 +510,7 @@ class KVEventsConfig:
     hwm: int
     max_queue_size: int
     topic: str
+    grpc_snapshot: bool
 
 
 @dataclass(slots=True)
@@ -593,6 +594,7 @@ ready_response = EngineCoreReadyResponse(
         hwm=100_000,
         max_queue_size=100_000,
         topic="kv",
+        grpc_snapshot=False,
     ),
     vllm_config={
         "model_config": {"model": "test-model", "max_model_len": 32768},

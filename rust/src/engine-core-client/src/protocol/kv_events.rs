@@ -84,6 +84,9 @@ pub struct BlockStored {
     /// None when lookahead hashing is disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lookahead_token_ids: Option<Vec<Vec<u32>>>,
+    /// The event reports blocks a request reused; they were already stored.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reuse_report: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

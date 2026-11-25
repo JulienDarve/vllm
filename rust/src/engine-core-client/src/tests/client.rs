@@ -4399,6 +4399,7 @@ fn python_msgpack_fixtures_match_rust_encoding_and_record_nixl_metrics() {
     assert_eq!(kv_events_config.buffer_steps, 10_000);
     assert_eq!(kv_events_config.hwm, 100_000);
     assert_eq!(kv_events_config.max_queue_size, 100_000);
+    assert!(!kv_events_config.grpc_snapshot);
 
     let lora_request_bytes = hex::decode(lora_request_hex).unwrap();
     let expected_lora_request = LoraRequest {

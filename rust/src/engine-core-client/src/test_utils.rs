@@ -266,6 +266,7 @@ impl MockKvEventPublisher {
                 hwm: 100_000,
                 max_queue_size: 100_000,
                 topic: "kv".to_string(),
+                grpc_snapshot: true,
                 frontend_endpoint: Some(endpoint),
             },
         }

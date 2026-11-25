@@ -4697,6 +4697,8 @@ def test_emit_cached_block_events():
     assert event.lora_id is None
     assert event.lora_name is None
     assert event.session_id == "agent-session-reuse"
+    # Consumers that count copies must be able to tell it from a store.
+    assert event.reuse_report
 
 
 def test_emit_cached_block_events_disabled():
